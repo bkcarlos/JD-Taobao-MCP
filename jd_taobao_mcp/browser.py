@@ -14,6 +14,7 @@ from playwright.async_api import (
 )
 
 from .config import Settings
+from .cart import cart_failure, read_jd_cart
 from .login_state import load_cookies, save_cookies, likely_logged_in, save_navigation_diagnostic
 from .safety import (
     SafetyError, display_url, ensure_allowed_url, ensure_readable_url,
@@ -265,6 +266,16 @@ class BrowserController:
             present = likely_logged_in(await self._context.cookies(), platform)
             return {"platform": platform, "likely_logged_in": present,
                     "message": "仅检测未过期登录凭据；服务端是否仍接受登录以实际查询为准。"}
+
+    async def get_cart(self, max_items: int) -> dict[str, Any]:
+        """Reuse login cookies for an isolated, temporary, read-only JD cart query."""
+        async with self._lock:
+            self.ensure_not_logging_in()
+            await self._active_page_unlocked()
+            assert self._context is not None
+            if not likely_logged_in(await self._context.cookies(), "jd"):
+                return cart_failure("login_required")
+            return await read_jd_cart(self._context, max_items, self.settings.navigation_timeout_ms)
 
     async def start_qr_login(self, deadline: float) -> None:
         """Open only the official JD login page for a short-lived human session."""

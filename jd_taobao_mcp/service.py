@@ -18,6 +18,14 @@ class ShoppingBrowserService:
         self.taobao_browser = BrowserController(self._settings_for_platform("taobao"))
         self.browser = self.taobao_browser
 
+    async def get_cart(self, platform: str = "jd", max_items: int = 50) -> dict[str, Any]:
+        """Return only JD cart merchandise; other platforms are not enabled."""
+        if platform != "jd":
+            raise ValueError("购物车读取目前仅支持京东（jd）。")
+        if type(max_items) is not int or not 1 <= max_items <= 100:
+            raise ValueError("max_items 必须是 1 到 100 的整数。")
+        return await self.jd_browser.get_cart(max_items)
+
     async def search_products(
         self,
         platform: str,

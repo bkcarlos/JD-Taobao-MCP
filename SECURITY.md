@@ -1,6 +1,6 @@
 # Security boundaries
 
-This is a local, single-user product reader. Complete login and verification directly in the visible browser. Never give account passwords, SMS codes, payment credentials or identity documents to an MCP client.
+This is a local, single-user product and JD cart reader. Complete login and verification directly in the visible browser. Never give account passwords, SMS codes, payment credentials or identity documents to an MCP client.
 
 ## Data exposed to MCP
 
@@ -9,6 +9,25 @@ This is a local, single-user product reader. Complete login and verification dir
 - Cookie presence is checked locally as a login hint. Neither cookie names nor values are returned.
 - Input, form submission, screenshot and history tools are removed. Link navigation does not invoke page click handlers. Setting the old `ALLOW_STATE_CHANGING_ACTIONS=true` fails at startup.
 - Public links discard unknown query parameters and fragments. Extracted image URLs must belong to the platform resource allowlist and omit query parameters and fragments.
+
+### Private JD cart
+
+`get_cart` is a separate, authenticated account-data capability. It copies the existing
+JD login cookies into an ephemeral browser context, opens only `https://cart.jd.com/cart_index`,
+and closes the context after the read. Generic navigation, snapshots and product extraction
+still reject the cart. Only the observed POST query `pcCart_jc_getCurrentCart` at
+`https://api.m.jd.com/api` and static assets from `360buyimg.com` are allowed in this context.
+All redirects, other APIs, iframe documents, WebSockets, service workers and downloads
+are blocked. No tool clicks, changes quantities/selection, claims coupons, deletes items
+or proceeds to checkout. Platform query behavior is still controlled by JD.
+
+The response includes only merchandise fields and the selected-items estimate. Account
+identifiers, addresses, cookie values, internal item identifiers, provider errors and the
+raw response are discarded. Cart contents are private data delivered to the authorized
+MCP client/model; they are not public product results. The server does not persist them,
+but clients may store tool results in their chat history. All clients holding the MCP
+token can access this single user's cart; keep the token private. No real cart fixtures
+belong in the repository. Missing prices remain unknown, and partial results are labeled.
 
 ## Network controls and limitations
 
