@@ -17,7 +17,7 @@ from .config import Settings
 from .login_state import load_cookies, save_cookies, likely_logged_in
 from .safety import (
     SafetyError, display_url, ensure_allowed_url, ensure_readable_url,
-    is_allowed_request, is_jd_login_callback, is_readable_url, public_url,
+    is_allowed_request, is_jd_login_callback, is_jd_verification_page, is_readable_url, public_url,
 )
 
 
@@ -75,7 +75,7 @@ class BrowserController:
             self.login_navigation_blocked = True
         # Even arbitrary hostnames can contain identifiers. Export only these
         # literal public hostnames; this list does not grant navigation access.
-        known_hosts = {"passport.jd.com", "plogin.m.jd.com", "safe.jd.com", "sso.jd.com",
+        known_hosts = {"passport.jd.com", "plogin.m.jd.com", "safe.jd.com", "sso.jd.com", "cfe.m.jd.com",
                        "www.jd.com", "item.jd.com", "search.jd.com", "login.taobao.com"}
         try:
             parsed = urlparse(url)
@@ -86,13 +86,13 @@ class BrowserController:
         self._login_navigation_issue = {"reason": reason, "host": host, "scheme": scheme}
 
     def _request_allowed(self, request: Any, url: str) -> bool:
-        """Permit the SSO handoff only for an active human's main-frame GET."""
+        """Permit fixed authentication hops only for an active human's main-frame GET."""
         navigation = request.is_navigation_request()
         if is_allowed_request(url, navigation=navigation):
             return True
         return (navigation and self.login_until > time.monotonic() and self._page is not None
                 and request.frame == self._page.main_frame and request.method == "GET"
-                and is_jd_login_callback(url))
+                and (is_jd_login_callback(url) or is_jd_verification_page(url)))
 
     async def _guard_request(self, route: Route) -> None:
         """Inspect redirects without automatically following them outside the allowlist."""
@@ -232,7 +232,8 @@ class BrowserController:
         except PlaywrightError:
             raise SafetyError("页面请求失败或跳转被安全策略阻止；请在本机浏览器中检查。") from None
         await self._settle(page)
-        ensure_allowed_url(page.url)
+        if not (self.login_until > time.monotonic() and is_jd_verification_page(page.url)):
+            ensure_allowed_url(page.url)
         return {"success": True, "url": display_url(page.url),
                 "http_status": response.status if response else None,
                 "requires_manual_login": not is_readable_url(page.url)}
@@ -304,9 +305,9 @@ class BrowserController:
             await self._end_login_unlocked()
 
     async def _human_login_page_unlocked(self) -> Page:
-        """Human interaction is confined to the fixed official login document."""
+        """Human interaction is confined to fixed official login/verification documents."""
         page = await self._active_page_unlocked()
-        if self.login_until <= time.monotonic() or not self._is_jd_login_page(page.url):
+        if self.login_until <= time.monotonic() or not self._is_human_login_document(page.url):
             raise SafetyError("登录页已失效或跳转；请重新打开登录入口。")
         return page
 
@@ -314,6 +315,8 @@ class BrowserController:
         """Submit human-supplied credentials to JD's fixed form; never log or return them."""
         async with self._lock:
             page = await self._human_login_page_unlocked()
+            if not self._is_jd_login_page(page.url):
+                raise SafetyError("请先完成人工验证，再提交登录。")
             # Never choose an arbitrary form/selector supplied by the caller.
             await page.locator("#formlogin #loginname").fill(username, timeout=5000)
             await page.locator("#formlogin #nloginpwd").fill(password, timeout=5000)
@@ -326,7 +329,7 @@ class BrowserController:
         async with self._lock:
             page = await self._human_login_page_unlocked()
             data = await page.screenshot(type="png", timeout=5000)
-            if not self._is_jd_login_page(page.url):
+            if not self._is_human_login_document(page.url):
                 raise SafetyError("登录页面已改变。")
             return data
 
@@ -342,7 +345,7 @@ class BrowserController:
             try:
                 previous = points[0]["t"]
                 for point in points[1:]:
-                    if self.login_until <= time.monotonic() or not self._is_jd_login_page(page.url):
+                    if self.login_until <= time.monotonic() or not self._is_human_login_document(page.url):
                         raise SafetyError("登录页面已改变或过期。")
                     await asyncio.sleep(min(0.1, max(0, (point["t"]-previous)/1000)))
                     await page.mouse.move(point["x"]*viewport["width"], point["y"]*viewport["height"])
@@ -381,6 +384,11 @@ class BrowserController:
             return data
 
     @staticmethod
+    def _is_human_login_document(url: str) -> bool:
+        """Allow a human to view the fixed challenge, without exporting it to MCP."""
+        return BrowserController._is_jd_login_page(url) or is_jd_verification_page(url)
+
+    @staticmethod
     def _is_jd_login_page(url: str) -> bool:
         """Match a fixed login document, not arbitrary pages on the account host."""
         parsed = urlparse(url)
@@ -391,6 +399,11 @@ class BrowserController:
         """Save detected credentials atomically before reporting a completed scan."""
         async with self._lock:
             if self._context is None:
+                return False
+            if self._page is not None and (is_jd_login_callback(self._page.url)
+                                           or is_jd_verification_page(self._page.url)):
+                # Cookie presence must not interrupt an unfinished handoff or
+                # close the human's challenge before JD finishes processing it.
                 return False
             cookies = await self._context.cookies()
             if not likely_logged_in(cookies, "jd"):

@@ -70,6 +70,13 @@ def is_jd_login_callback(url: str) -> bool:
             and parsed.path == "/setCookie")
 
 
+def is_jd_verification_page(url: str) -> bool:
+    """Recognize the fixed risk-verification document observed in JD redirects."""
+    parsed = _parse_https(url)
+    return (parsed is not None and parsed.hostname == "cfe.m.jd.com"
+            and parsed.path == "/privatedomain/risk_handler/03101900/")
+
+
 def ensure_product_url(url: str) -> str:
     """Detail extraction is not a generic account-page scraper."""
     parsed = _parse_https(url)

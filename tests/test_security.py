@@ -14,7 +14,7 @@ from jd_taobao_mcp.extractors.search import extract_jd_search, extract_taobao_se
 from jd_taobao_mcp.http_auth import BearerAuth, http_transport_security
 from jd_taobao_mcp.safety import (
     SafetyError, display_url, ensure_product_url, is_allowed_request,
-    is_allowed_url, is_jd_login_callback, is_readable_url, public_url,
+    is_allowed_url, is_jd_login_callback, is_jd_verification_page, is_readable_url, public_url,
 )
 
 
@@ -74,6 +74,17 @@ class UrlTests(unittest.TestCase):
                     "https://sso.jd.com/%73etCookie", "https://order.jd.com/setCookie"):
             self.assertFalse(is_jd_login_callback(url), url)
 
+    def test_risk_verification_is_exact_and_never_public(self):
+        url = "https://cfe.m.jd.com/privatedomain/risk_handler/03101900/?token=FAKE"
+        self.assertTrue(is_jd_verification_page(url))
+        self.assertFalse(is_allowed_url(url))
+        self.assertFalse(is_readable_url(url))
+        self.assertEqual(display_url(url), "")
+        for invalid in (url.replace("https:", "http:"), url.replace("cfe.m.jd.com", "evil.example"),
+                        url.replace("cfe.m.jd.com", "user:password@cfe.m.jd.com"),
+                        url.replace("03101900", "other"), url.replace("/privatedomain/", "/account/")):
+            self.assertFalse(is_jd_verification_page(invalid))
+
 
 class BrowserTests(unittest.IsolatedAsyncioTestCase):
     def controller(self, url="https://item.jd.com/123.html"):
@@ -121,6 +132,40 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                 route.abort.assert_awaited_once_with("blockedbyclient")
                 route.fulfill.assert_not_awaited()
             self.assertNotIn("FAKE", json.dumps(c._login_navigation_issue))
+
+    async def test_verification_requires_human_session_and_rejects_password_fill(self):
+        url = "https://cfe.m.jd.com/privatedomain/risk_handler/03101900/?token=FAKE"
+        c, page = self.controller(url)
+        page.main_frame = object()
+        page.locator = Mock()
+        c._page = page
+        request = SimpleNamespace(url=url, frame=page.main_frame, method="GET",
+                                  is_navigation_request=lambda: True)
+        self.assertFalse(c._request_allowed(request, url))
+        c.login_until = time.monotonic() + 60
+        self.assertTrue(c._request_allowed(request, url))
+        self.assertIs(await c._human_login_page_unlocked(), page)
+        with self.assertRaises(SafetyError):
+            await c.submit_password("FAKE_USER", "FAKE_PASSWORD")
+        page.locator.assert_not_called()
+        request.frame = object()
+        self.assertFalse(c._request_allowed(request, url))
+        c.login_until = 0
+        with self.assertRaises(SafetyError):
+            await c._human_login_page_unlocked()
+        with self.assertRaises(SafetyError):
+            await c.snapshot()
+
+    async def test_checkpoint_does_not_interrupt_pending_sso_or_verification(self):
+        for url in ("https://sso.jd.com/setCookie?token=FAKE",
+                    "https://cfe.m.jd.com/privatedomain/risk_handler/03101900/?token=FAKE"):
+            c, page = self.controller(url)
+            c._page = page
+            c._context = SimpleNamespace(cookies=AsyncMock())
+            c._end_login_unlocked = AsyncMock()
+            self.assertFalse(await c.checkpoint_login())
+            c._context.cookies.assert_not_awaited()
+            c._end_login_unlocked.assert_not_awaited()
 
     async def test_sensitive_pages_not_evaluated(self):
         for url in ("https://passport.jd.com/new/login.aspx", "https://order.jd.com/list"):
