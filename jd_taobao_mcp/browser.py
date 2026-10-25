@@ -14,7 +14,7 @@ from playwright.async_api import (
 )
 
 from .config import Settings
-from .login_state import load_cookies, save_cookies, likely_logged_in
+from .login_state import load_cookies, save_cookies, likely_logged_in, save_navigation_diagnostic
 from .safety import (
     SafetyError, display_url, ensure_allowed_url, ensure_readable_url,
     is_allowed_request, is_jd_login_callback, is_jd_verification_page, is_readable_url, public_url,
@@ -84,6 +84,8 @@ class BrowserController:
         except ValueError:
             host, scheme = "other", "other"
         self._login_navigation_issue = {"reason": reason, "host": host, "scheme": scheme}
+        with suppress(OSError, SafetyError, ValueError):
+            save_navigation_diagnostic(self.settings.profile_dir, url, reason)
 
     def _request_allowed(self, request: Any, url: str) -> bool:
         """Permit fixed authentication hops only for an active human's main-frame GET."""

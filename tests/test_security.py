@@ -1,5 +1,7 @@
 import json
 import time
+import tempfile
+from pathlib import Path
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
@@ -88,7 +90,9 @@ class UrlTests(unittest.TestCase):
 
 class BrowserTests(unittest.IsolatedAsyncioTestCase):
     def controller(self, url="https://item.jd.com/123.html"):
-        c = BrowserController(replace(Settings.from_env(), action_delay_ms=0))
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        c = BrowserController(replace(Settings.from_env(), action_delay_ms=0, profile_dir=Path(directory.name)/"profile"))
         p = SimpleNamespace(url=url, evaluate=AsyncMock(return_value=[]))
         c._active_page_unlocked = AsyncMock(return_value=p)
         return c, p

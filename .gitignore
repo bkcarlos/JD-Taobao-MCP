@@ -24,4 +24,5 @@ artifacts/*
 *.zip
 # Private login snapshots, regardless of profile directory override
 login-cookies.json
+login-navigation.json
 .cookies-*

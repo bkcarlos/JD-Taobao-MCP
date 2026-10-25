@@ -83,6 +83,14 @@ can view or interact with that document. Password autofill remains restricted to
 original login form; verification pages, their parameters and contents are never exported
 to MCP. This supports manual verification and does not bypass a platform rejection.
 
+For blocked or failed main-frame navigation during human login, the private profile keeps
+one `login-navigation.json` record (mode 0600), replaced on the next failure. It contains the
+timestamp, failure type, scheme, hostname and bounded path, never URL userinfo, query,
+fragment, request bodies or cookies. Treat endpoint metadata as private: this file is
+ignored by Git and is not returned through MCP or the portal. MCP status continues to
+redact unrecognized hostnames. An administrator can inspect this record to review a
+specific destination rather than widening navigation rules based on guesses.
+
 Cookie snapshots remain inside the private persistent profile (0700 directory, atomic
 0600 file). They are not returned to MCP or the portal and are ignored by Git. Only
 unexpired first-party cookies are restored, without overwriting newer Chromium state.

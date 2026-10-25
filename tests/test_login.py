@@ -16,7 +16,7 @@ from jd_taobao_mcp.browser import BrowserController
 from jd_taobao_mcp.config import Settings
 from jd_taobao_mcp.http_auth import BearerAuth
 from jd_taobao_mcp.login_portal import LoginPortal, WithLoginPortal
-from jd_taobao_mcp.login_state import load_cookies, save_cookies, likely_logged_in
+from jd_taobao_mcp.login_state import load_cookies, save_cookies, likely_logged_in, save_navigation_diagnostic
 from jd_taobao_mcp.safety import SafetyError
 
 
@@ -26,6 +26,28 @@ def fixture_cookie(name="thor", expires=-1):
 
 
 class StateTests(unittest.TestCase):
+    def test_navigation_record_is_private_bounded_and_excludes_url_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)/"profile"
+            save_navigation_diagnostic(directory,
+                "https://FAKE_USER:FAKE_PASSWORD@login.example.test/callback?token=FAKE_QUERY#FAKE_FRAGMENT",
+                "navigation_denied")
+            path = directory/"login-navigation.json"
+            data = json.loads(path.read_text())
+            self.assertEqual(data['host'], 'login.example.test')
+            self.assertEqual(data['path'], '/callback')
+            self.assertNotIn('FAKE', path.read_text())
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+            outside = Path(tmp)/"outside"
+            outside.write_text('untouched')
+            path.unlink()
+            path.symlink_to(outside)
+            save_navigation_diagnostic(directory, 'https://login.example.test/'+('a'*2000), 'request_failed')
+            self.assertEqual(outside.read_text(), 'untouched')
+            self.assertFalse(path.is_symlink())
+            self.assertEqual(len(json.loads(path.read_text())['path']), 512)
+
     def test_restart_loads_session_cookies_with_private_permissions(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)/"profile"

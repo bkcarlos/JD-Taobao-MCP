@@ -8,6 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from .safety import SafetyError
 
@@ -42,6 +43,21 @@ def likely_logged_in(cookies: list[dict[str, Any]], platform: str) -> bool:
 
 def save_cookies(directory: Path, cookies: list[dict[str, Any]]) -> None:
     """Atomically persist session cookies in a mode-0600 file in the private profile."""
+    _write_private_json(directory, "login-cookies.json", {"version": 1, "cookies": usable_cookies(cookies)})
+
+
+def save_navigation_diagnostic(directory: Path, url: str, reason: str) -> None:
+    """Keep one private endpoint record, omitting userinfo, query, fragment and body."""
+    parsed = urlparse(url)
+    _write_private_json(directory, "login-navigation.json", {
+        "version": 1, "recorded_at": int(time.time()), "reason": reason,
+        "scheme": parsed.scheme if parsed.scheme in {"https", "http"} else "other",
+        "host": (parsed.hostname or "")[:253], "path": parsed.path[:512],
+    })
+
+
+def _write_private_json(directory: Path, filename: str, data: dict[str, Any]) -> None:
+    """Atomically replace an internal state file without following a target symlink."""
     if directory.is_symlink():
         raise SafetyError("浏览器资料目录不能是符号链接。")
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -49,10 +65,10 @@ def save_cookies(directory: Path, cookies: list[dict[str, Any]]) -> None:
     fd, temporary = tempfile.mkstemp(prefix=".cookies-", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump({"version": 1, "cookies": usable_cookies(cookies)}, stream)
+            json.dump(data, stream)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, directory / "login-cookies.json")
+        os.replace(temporary, directory / filename)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
