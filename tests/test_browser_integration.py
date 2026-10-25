@@ -39,10 +39,11 @@ class BrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.context.route("**/*", lambda route: route.fulfill(body="<html></html>", content_type="text/html"))
         await self.page.goto("https://item.jd.com/123.html")
         unrelated = '''<h1>Example calculator</h1>
+            <div class="top-name">Example store</div>
             <span class="cross_platform_card_price">¥999.00</span>
             <span class="service-price">19.00</span>'''
         for markup, expected in [
-            ('<div class="top-name">Example mouse</div><div class="product-price-panel"><span class="product-price--main"><span>¥</span><span>123.45</span></span></div>', 123.45),
+            ('<title>Example mouse</title><div class="product-price-panel"><span class="product-price--main"><span>¥</span><span>123.45</span></span></div>', 123.45),
             ('<div class="sku-name">Example mouse</div><div class="summary-price"><span class="price">¥89.00</span></div>', 89.0),
             ('<meta property="og:title" content="Example mouse">', None),
         ]:

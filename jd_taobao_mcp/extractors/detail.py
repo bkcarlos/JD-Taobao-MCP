@@ -212,6 +212,7 @@ async def extract_product_detail(page: Page, platform: str) -> dict[str, Any]:
             images,
             json_ld: jsonLd,
             meta: {
+              document_title: document.title || '',
               og_title: document.querySelector('meta[property="og:title"]')?.content || '',
               description: document.querySelector('meta[name="description"]')?.content || document.querySelector('meta[property="og:description"]')?.content || '',
               canonical: document.querySelector('link[rel="canonical"]')?.href || ''
@@ -227,7 +228,8 @@ async def extract_product_detail(page: Page, platform: str) -> dict[str, Any]:
     title = compact_text(
         raw.get("title")
         or raw.get("meta", {}).get("og_title")
-        or json_product.get("name"),
+        or json_product.get("name")
+        or raw.get("meta", {}).get("document_title"),
         500,
     )
     price_text = compact_text(raw.get("price_text"), 120)
@@ -297,7 +299,7 @@ async def extract_product_detail(page: Page, platform: str) -> dict[str, Any]:
 def _selectors(platform: str) -> dict[str, list[str]]:
     if platform == "jd":
         return {
-            "title": [".top-name", ".sku-name", "#name h1", "meta[property='og:title']"],
+            "title": [".sku-name", "#name h1", "meta[property='og:title']"],
             "price": [
                 ".product-price-panel .product-price--main",
                 ".p-price .price",
