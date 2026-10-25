@@ -121,7 +121,7 @@ class BrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
           <form id="formlogin" onsubmit="return false"><input id="loginname"><input id="nloginpwd" type="password"><button id="loginsubmit" type="button">Login</button></form>
           <div id="knob"></div><script>
           window.dragging=false;window.dragX=120;window.releases=0;
-          document.getElementById('knob').onmousedown=()=>{window.dragging=true;};
+          document.getElementById('knob').onmousedown=e=>{e.preventDefault();window.dragging=true;};
           document.onmousemove=e=>{if(window.dragging){window.dragX=e.clientX;document.getElementById('knob').style.left=(e.clientX-20)+'px';}};
           document.onmouseup=()=>{if(window.dragging)window.releases++;window.dragging=false;};
           </script>'''
