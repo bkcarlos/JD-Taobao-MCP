@@ -1,4 +1,5 @@
 import json
+import time
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
@@ -147,6 +148,46 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         await c._block_websocket(ws)
         ws.close.assert_awaited_once()
         ws.connect_to_server.assert_not_called()
+
+    async def test_login_redirect_diagnostics_exclude_secrets_and_preserve_boundary(self):
+        c, page = self.controller()
+        page.main_frame = object()
+        c._page, c._context = page, object()
+        c.login_until = time.monotonic() + 60
+        request = SimpleNamespace(url="https://passport.jd.com/new/login.aspx", method="GET",
+                                  frame=page.main_frame, is_navigation_request=lambda: True)
+        for target, host, scheme in (
+            ("https://safe.jd.com/FAKE_PATH?token=FAKE_QUERY#FAKE_FRAGMENT", "safe.jd.com", "https"),
+            ("http://FAKE_USER:FAKE_PASSWORD@www.jd.com/", "www.jd.com", "http"),
+            ("https://FAKE_ACCOUNT.jd.com/", "other", "https"),
+        ):
+            response = SimpleNamespace(status=302, headers={"location": target}, dispose=AsyncMock())
+            route = SimpleNamespace(request=request, abort=AsyncMock(),
+                                    fetch=AsyncMock(return_value=response), fulfill=AsyncMock())
+            await c._guard_request(route)
+            route.abort.assert_awaited_once_with("blockedbyclient")
+            route.fulfill.assert_not_awaited()
+            result = await c.status()
+            self.assertTrue(result["login_active"])
+            self.assertEqual(result["login_navigation_issue"],
+                             {"reason": "redirect_denied", "host": host, "scheme": scheme})
+            self.assertNotIn("FAKE", json.dumps(result))
+
+    async def test_login_diagnostics_ignore_iframes_and_expired_sessions(self):
+        c, page = self.controller()
+        page.main_frame = object()
+        c._page = page
+        c.login_until = time.monotonic() + 60
+        request = SimpleNamespace(url="https://collector.example/", frame=object(),
+                                  is_navigation_request=lambda: True)
+        route = SimpleNamespace(request=request, abort=AsyncMock(), fetch=AsyncMock())
+        await c._guard_request(route)
+        self.assertIsNone(c._login_navigation_issue)
+        self.assertFalse(c.login_navigation_blocked)
+        request.frame = page.main_frame
+        c.login_until = 0
+        await c._guard_request(route)
+        self.assertIsNone(c._login_navigation_issue)
 
     async def test_product_output_excludes_raw_page_and_jsonld(self):
         page = SimpleNamespace(

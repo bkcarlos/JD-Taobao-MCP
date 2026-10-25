@@ -53,6 +53,7 @@ class BrowserController:
         self._lock = asyncio.Lock()
         self.login_until = 0.0
         self.login_navigation_blocked = False
+        self._login_navigation_issue: dict[str, str] | None = None
         self._login_expiry_task: asyncio.Task | None = None
 
     @property
@@ -65,14 +66,31 @@ class BrowserController:
             return {"success": True, "headless": self.settings.headless,
                     "current_url": display_url(page.url)}
 
+    def _record_login_navigation_issue(self, request: Any, url: str, reason: str) -> None:
+        """Keep bounded main-frame diagnostics without URLs or account identifiers."""
+        if (self.login_until <= time.monotonic() or self._page is None
+                or not request.is_navigation_request() or request.frame != self._page.main_frame):
+            return
+        if reason != "request_failed":
+            self.login_navigation_blocked = True
+        # Even arbitrary hostnames can contain identifiers. Export only these
+        # literal public hostnames; this list does not grant navigation access.
+        known_hosts = {"passport.jd.com", "plogin.m.jd.com", "safe.jd.com",
+                       "www.jd.com", "item.jd.com", "search.jd.com", "login.taobao.com"}
+        try:
+            parsed = urlparse(url)
+            host = parsed.hostname if parsed.hostname in known_hosts else "other"
+            scheme = parsed.scheme if parsed.scheme in {"http", "https"} else "other"
+        except ValueError:
+            host, scheme = "other", "other"
+        self._login_navigation_issue = {"reason": reason, "host": host, "scheme": scheme}
+
     async def _guard_request(self, route: Route) -> None:
         """Inspect redirects without automatically following them outside the allowlist."""
         request = route.request
         navigation = request.is_navigation_request()
         if not is_allowed_request(request.url, navigation=navigation):
-            if (navigation and self.login_until > time.monotonic() and self._page is not None
-                    and request.frame == self._page.main_frame):
-                self.login_navigation_blocked = True
+            self._record_login_navigation_issue(request, request.url, "navigation_denied")
             await route.abort("blockedbyclient")
             return
         try:
@@ -82,9 +100,7 @@ class BrowserController:
                 if 300 <= response.status < 400 and location:
                     target = urljoin(request.url, location)
                     if not is_allowed_request(target, navigation=navigation):
-                        if (navigation and self.login_until > time.monotonic() and self._page is not None
-                                and request.frame == self._page.main_frame):
-                            self.login_navigation_blocked = True
+                        self._record_login_navigation_issue(request, target, "redirect_denied")
                         await route.abort("blockedbyclient")
                         return
                     # Chromium does not re-enter Playwright routing for an HTTP
@@ -92,6 +108,7 @@ class BrowserController:
                     # A fresh document navigation is intercepted again. Do not
                     # replay POST bodies or synthesize subresource redirects.
                     if not navigation or (response.status in (307, 308) and request.method not in ("GET", "HEAD")):
+                        self._record_login_navigation_issue(request, target, "redirect_replay_denied")
                         await route.abort("blockedbyclient")
                         return
                     await route.fulfill(
@@ -110,6 +127,7 @@ class BrowserController:
                 with suppress(PlaywrightError):
                     await response.dispose()
         except PlaywrightError:
+            self._record_login_navigation_issue(request, request.url, "request_failed")
             with suppress(PlaywrightError):
                 await route.abort("failed")
 
@@ -177,7 +195,7 @@ class BrowserController:
     def ensure_not_logging_in(self) -> None:
         """Prevent MCP navigation from disturbing the human login session."""
         if self.login_until > time.monotonic():
-            raise SafetyError("正在等待人工扫码，请完成或关闭登录页后再查询商品。")
+            raise SafetyError("正在等待人工登录，请完成或关闭登录页后再查询商品。")
 
     async def _readable_page_unlocked(self) -> Page:
         self.ensure_not_logging_in()
@@ -190,7 +208,9 @@ class BrowserController:
             if self._context is None:
                 return {"running": False}
             page = await self._active_page_unlocked()
-            return {"running": True, "current_url": display_url(page.url)}
+            return {"running": True, "current_url": display_url(page.url),
+                    "login_active": self.login_until > time.monotonic(),
+                    "login_navigation_issue": self._login_navigation_issue}
 
     async def _navigate_unlocked(self, page: Page, url: str) -> dict[str, Any]:
         ensure_allowed_url(url)
@@ -237,6 +257,7 @@ class BrowserController:
         async with self._lock:
             self.login_until = deadline
             self.login_navigation_blocked = False
+            self._login_navigation_issue = None
             if self._login_expiry_task:
                 self._login_expiry_task.cancel()
             self._login_expiry_task = asyncio.create_task(self._expire_login(deadline))
