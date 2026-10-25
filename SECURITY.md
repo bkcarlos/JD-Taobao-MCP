@@ -73,6 +73,11 @@ CAPTCHA solver; existing MFA and verification requirements remain in force. The 
 page, including transient password/code fields, is cleared on success, cancellation or
 expiry. Cookie persistence remains separate from password input.
 
+While that human session is active, main-frame GET navigation may also visit the exact
+HTTPS endpoint `sso.jd.com/setCookie`, used by JD's login script for its SSO cookie handoff.
+Every subsequent redirect is checked again. This exception does not permit other SSO
+paths, iframe navigation, POST replay, MCP navigation, or reading the callback page.
+
 Cookie snapshots remain inside the private persistent profile (0700 directory, atomic
 0600 file). They are not returned to MCP or the portal and are ignored by Git. Only
 unexpired first-party cookies are restored, without overwriting newer Chromium state.

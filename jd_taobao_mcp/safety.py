@@ -63,6 +63,13 @@ def is_allowed_url(url: str) -> bool:
     return parsed is not None and (is_readable_url(url) or parsed.hostname in _LOGIN_HOSTS)
 
 
+def is_jd_login_callback(url: str) -> bool:
+    """Recognize JD's fixed SSO cookie handoff, never a readable product URL."""
+    parsed = _parse_https(url)
+    return (parsed is not None and parsed.hostname == "sso.jd.com"
+            and parsed.path == "/setCookie")
+
+
 def ensure_product_url(url: str) -> str:
     """Detail extraction is not a generic account-page scraper."""
     parsed = _parse_https(url)

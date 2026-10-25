@@ -14,7 +14,7 @@ from jd_taobao_mcp.extractors.search import extract_jd_search, extract_taobao_se
 from jd_taobao_mcp.http_auth import BearerAuth, http_transport_security
 from jd_taobao_mcp.safety import (
     SafetyError, display_url, ensure_product_url, is_allowed_request,
-    is_allowed_url, is_readable_url, public_url,
+    is_allowed_url, is_jd_login_callback, is_readable_url, public_url,
 )
 
 
@@ -62,6 +62,18 @@ class UrlTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 Settings.from_env()
 
+    def test_sso_callback_is_exact_and_never_public(self):
+        valid = "https://sso.jd.com/setCookie?token=FAKE_TOKEN#FAKE_FRAGMENT"
+        self.assertTrue(is_jd_login_callback(valid))
+        self.assertFalse(is_allowed_url(valid))
+        self.assertFalse(is_readable_url(valid))
+        self.assertEqual(display_url(valid), "")
+        for url in ("http://sso.jd.com/setCookie", "https://sso.jd.com.evil.example/setCookie",
+                    "https://user:pass@sso.jd.com/setCookie", "https://sso.jd.com:8443/setCookie",
+                    "https://sso.jd.com/account", "https://sso.jd.com/setCookie/../account",
+                    "https://sso.jd.com/%73etCookie", "https://order.jd.com/setCookie"):
+            self.assertFalse(is_jd_login_callback(url), url)
+
 
 class BrowserTests(unittest.IsolatedAsyncioTestCase):
     def controller(self, url="https://item.jd.com/123.html"):
@@ -69,6 +81,46 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         p = SimpleNamespace(url=url, evaluate=AsyncMock(return_value=[]))
         c._active_page_unlocked = AsyncMock(return_value=p)
         return c, p
+
+    async def test_sso_callback_requires_live_human_main_frame_get(self):
+        c, page = self.controller()
+        page.main_frame = object()
+        c._page = page
+        url = "https://sso.jd.com/setCookie?token=FAKE"
+        request = SimpleNamespace(url=url, frame=page.main_frame, method="GET",
+                                  is_navigation_request=lambda: True)
+        self.assertFalse(c._request_allowed(request, url))
+        c.login_until = time.monotonic() + 60
+        self.assertTrue(c._request_allowed(request, url))
+        request.method = "POST"
+        self.assertFalse(c._request_allowed(request, url))
+        request.method, request.frame = "GET", object()
+        self.assertFalse(c._request_allowed(request, url))
+        request.frame = page.main_frame
+        c.login_until = time.monotonic() - 1
+        self.assertFalse(c._request_allowed(request, url))
+
+    async def test_sso_handoff_rechecks_redirect_destination(self):
+        c, page = self.controller()
+        page.main_frame = object()
+        c._page, c.login_until = page, time.monotonic() + 60
+        request = SimpleNamespace(url="https://sso.jd.com/setCookie?token=FAKE", method="GET",
+                                  frame=page.main_frame, is_navigation_request=lambda: True)
+        for target, allowed in (("https://www.jd.com/", True),
+                                ("https://order.jd.com/list", False),
+                                ("https://collector.example/", False)):
+            response = SimpleNamespace(status=302, headers={"location": target}, dispose=AsyncMock())
+            route = SimpleNamespace(request=request, abort=AsyncMock(), fetch=AsyncMock(return_value=response),
+                                    fulfill=AsyncMock())
+            await c._guard_request(route)
+            route.fetch.assert_awaited_once()
+            if allowed:
+                route.fulfill.assert_awaited_once()
+                route.abort.assert_not_awaited()
+            else:
+                route.abort.assert_awaited_once_with("blockedbyclient")
+                route.fulfill.assert_not_awaited()
+            self.assertNotIn("FAKE", json.dumps(c._login_navigation_issue))
 
     async def test_sensitive_pages_not_evaluated(self):
         for url in ("https://passport.jd.com/new/login.aspx", "https://order.jd.com/list"):

@@ -17,7 +17,7 @@ from .config import Settings
 from .login_state import load_cookies, save_cookies, likely_logged_in
 from .safety import (
     SafetyError, display_url, ensure_allowed_url, ensure_readable_url,
-    is_allowed_request, is_readable_url, public_url,
+    is_allowed_request, is_jd_login_callback, is_readable_url, public_url,
 )
 
 
@@ -75,7 +75,7 @@ class BrowserController:
             self.login_navigation_blocked = True
         # Even arbitrary hostnames can contain identifiers. Export only these
         # literal public hostnames; this list does not grant navigation access.
-        known_hosts = {"passport.jd.com", "plogin.m.jd.com", "safe.jd.com",
+        known_hosts = {"passport.jd.com", "plogin.m.jd.com", "safe.jd.com", "sso.jd.com",
                        "www.jd.com", "item.jd.com", "search.jd.com", "login.taobao.com"}
         try:
             parsed = urlparse(url)
@@ -85,11 +85,20 @@ class BrowserController:
             host, scheme = "other", "other"
         self._login_navigation_issue = {"reason": reason, "host": host, "scheme": scheme}
 
+    def _request_allowed(self, request: Any, url: str) -> bool:
+        """Permit the SSO handoff only for an active human's main-frame GET."""
+        navigation = request.is_navigation_request()
+        if is_allowed_request(url, navigation=navigation):
+            return True
+        return (navigation and self.login_until > time.monotonic() and self._page is not None
+                and request.frame == self._page.main_frame and request.method == "GET"
+                and is_jd_login_callback(url))
+
     async def _guard_request(self, route: Route) -> None:
         """Inspect redirects without automatically following them outside the allowlist."""
         request = route.request
         navigation = request.is_navigation_request()
-        if not is_allowed_request(request.url, navigation=navigation):
+        if not self._request_allowed(request, request.url):
             self._record_login_navigation_issue(request, request.url, "navigation_denied")
             await route.abort("blockedbyclient")
             return
@@ -99,7 +108,7 @@ class BrowserController:
                 location = response.headers.get("location")
                 if 300 <= response.status < 400 and location:
                     target = urljoin(request.url, location)
-                    if not is_allowed_request(target, navigation=navigation):
+                    if not self._request_allowed(request, target):
                         self._record_login_navigation_issue(request, target, "redirect_denied")
                         await route.abort("blockedbyclient")
                         return

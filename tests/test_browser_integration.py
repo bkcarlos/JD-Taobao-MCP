@@ -179,6 +179,8 @@ class BrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 if self.path in ("/start", "/next", "/allowed-start"):
                     self.send_response(302)
                     self.send_header("Location", {"/start": "/next", "/next": "/collect", "/allowed-start": "/ok"}[self.path])
+                    if self.path == "/allowed-start":
+                        self.send_header("Set-Cookie", "fixture_session=FAKE_SESSION; HttpOnly; Path=/")
                     self.end_headers()
                 else:
                     self.send_response(200)
@@ -219,6 +221,9 @@ class BrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await self.page.wait_for_load_state("networkidle")
                 self.assertEqual(self.page.url, origin + "/ok")
                 self.assertEqual(visited, ["/start", "/next", "/ok", "/allowed-start", "/ok"])
+                cookies = await self.context.cookies(origin)
+                self.assertTrue(any(c["name"] == "fixture_session" and c["value"] == "FAKE_SESSION"
+                                    and c["httpOnly"] for c in cookies))
         finally:
             await asyncio.to_thread(server.shutdown)
             server.server_close()
