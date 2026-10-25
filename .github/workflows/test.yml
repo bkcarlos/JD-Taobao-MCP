@@ -13,10 +13,18 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install -e .
-      - run: python -m playwright install --with-deps chromium
-      - run: python -m unittest discover -s tests -v
-        env:
-          MCP_BROWSER_TESTS: '1'
+      - name: Build the sandboxed runtime
+        run: docker build -t shopping-mcp-test .
+      - name: Run offline tests inside the production sandbox
+        run: |
+          docker run --rm --init --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --security-opt seccomp=./docker/seccomp.json \
+            --tmpfs /tmp:rw,nosuid,noexec,size=256m,mode=1777 \
+            --tmpfs /data:rw,nosuid,noexec,size=64m,mode=0700,uid=10001,gid=10001 \
+            --shm-size 512m --pids-limit 512 \
+            -e MCP_BROWSER_TESTS=1 shopping-mcp-test \
+            python -m unittest discover -s tests -v
       - run: python -m pip wheel --no-deps . -w dist
       - name: Check installed entry point outside checkout
         run: |
