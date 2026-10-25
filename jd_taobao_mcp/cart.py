@@ -64,6 +64,99 @@ def _money(value: Any) -> float | None:
         return None
 
 
+def _quantity(value: Any) -> int | None:
+    """Keep provider quantities distinct from line counts and unknown values."""
+    return value if type(value) is int and 1 <= value <= 1_000_000 else None
+
+
+def _nested_details(raw: dict[str, Any], depth: int = 0) -> tuple[list, list, bool]:
+    """Read bundle components and displayed gift groups without unrelated metadata."""
+    if depth >= 4:
+        return [], [], True
+    components, gifts = [], []
+    partial = any(raw.get(key) for key in ("Gifts", "giftPools", "manGifts", "sipGifts"))
+    children = raw.get("items") or []
+    groups = raw.get("giftGroupInfosShow") or []
+    if not isinstance(children, list) or not isinstance(groups, list):
+        return [], [], True
+    for entry in children[:100]:
+        child = entry.get("item") if isinstance(entry, dict) else None
+        if not isinstance(child, dict):
+            partial = True
+            continue
+        sku = str(child.get("Id", ""))
+        title = _text(child.get("Name"), 500)
+        if not re.fullmatch(r"[0-9]{1,30}", sku) or not title:
+            partial = True
+            continue
+        nested, child_gifts, incomplete = _nested_details(child, depth + 1)
+        partial |= incomplete
+        # Raw Price can be the standalone reference price, not the bundle allocation.
+        price_text = _text(child.get("PriceShow"), 80)
+        components.append({"product_url": product_link(f"https://item.jd.com/{sku}.html"),
+                           "title": title, "quantity": _quantity(child.get("Num")),
+                           "unit_price": _money(price_text), "price_text": price_text,
+                           "components": nested, "gifts": child_gifts})
+    for group in groups[:100]:
+        rows = group.get("giftInfos") if isinstance(group, dict) else None
+        if not isinstance(rows, list):
+            partial = True
+            continue
+        group_quantity = 0
+        for gift in rows[:100]:
+            if not isinstance(gift, dict) or gift.get("couponInfo"):
+                partial = True
+                continue
+            sku = str(gift.get("id", ""))
+            title = _text(gift.get("name"), 500)
+            quantity = _quantity(gift.get("giftNum"))
+            if not re.fullmatch(r"[0-9]{1,30}", sku) or not title or quantity is None:
+                partial = True
+                continue
+            group_quantity += quantity
+            gifts.append({"product_url": product_link(f"https://item.jd.com/{sku}.html"),
+                          "title": title, "quantity": quantity})
+        expected = group.get("giftNum")
+        partial |= len(rows) > 100 or (type(expected) is int and expected != group_quantity)
+    return components, gifts, partial or len(children) > 100 or len(groups) > 100
+
+
+def _match_raw_item(row: dict, vendor: dict, raw_vendors: Any) -> dict | None:
+    """Join the public merchandise projection to its raw parent, never to a child SKU."""
+    if not isinstance(raw_vendors, list) or vendor.get("vendorId") is None:
+        return None
+    matches = []
+    for raw_vendor in raw_vendors:
+        if not isinstance(raw_vendor, dict) or raw_vendor.get("vendorId") != vendor["vendorId"]:
+            continue
+        entries = raw_vendor.get("sorted")
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            raw = entry.get("item") if isinstance(entry, dict) else None
+            if not isinstance(raw, dict):
+                continue
+            # JD uses the virtual SKU for a bundle, not its internal bundle Id.
+            sku = raw.get("vskuId") if entry.get("itemType") == 4 else raw.get("Id")
+            if str(sku) == str(row.get("skuId")):
+                matches.append(raw)
+    exact = [raw for raw in matches if row.get("skuUuid") and raw.get("skuUuid") == row["skuUuid"]]
+    matches = exact or matches
+    return matches[0] if len(matches) == 1 else None
+
+
+def _nested_counts(items: list[dict]) -> tuple[int, int, int]:
+    """Count child rows and gift units without adding bundle contents to parent units."""
+    components = gift_count = gift_quantity = 0
+    for item in items:
+        children, gifts = item.get("components", []), item.get("gifts", [])
+        nested_components, nested_gifts, nested_quantity = _nested_counts(children)
+        components += len(children) + nested_components
+        gift_count += len(gifts) + nested_gifts
+        gift_quantity += sum(gift["quantity"] for gift in gifts) + nested_quantity
+    return components, gift_count, gift_quantity
+
+
 def normalize_cart(payload: Any, max_items: int) -> dict[str, Any]:
     """Select cart merchandise fields; discard account, address and raw API metadata."""
     if not isinstance(payload, dict) or payload.get("success") is not True or payload.get("code") != 0:
@@ -84,6 +177,9 @@ def normalize_cart(payload: Any, max_items: int) -> dict[str, Any]:
         vendors = []
     items = []
     partial = False
+    cart_info = result.get("cartInfo")
+    raw_vendors = cart_info.get("vendors") if isinstance(cart_info, dict) else None
+    details_complete = True
     for vendor in vendors:
         rows = vendor.get("items") if isinstance(vendor, dict) else None
         if not isinstance(rows, list):
@@ -98,12 +194,15 @@ def normalize_cart(payload: Any, max_items: int) -> dict[str, Any]:
             if not re.fullmatch(r"[0-9]{1,30}", sku) or not title:
                 partial = True
                 continue
-            quantity = row.get("num")
-            if type(quantity) is not int or not 1 <= quantity <= 1_000_000:
-                quantity = None
+            quantity = _quantity(row.get("num"))
             tags = row.get("propertyTags")
             variant = " ".join(_text(v, 100) for k, v in list(tags.items())[:10] if k not in {"c", "d"}) if isinstance(tags, dict) else ""
             price_text = _text(row.get("priceShow"), 80)
+            raw = _match_raw_item(row, vendor, raw_vendors)
+            components, gifts, incomplete = _nested_details(raw) if raw is not None else ([], [], True)
+            if row.get("itemType") == 4 and not components:
+                incomplete = True
+            details_complete &= not incomplete
             items.append({
                 "product_url": product_link(f"https://item.jd.com/{sku}.html"),
                 "title": title, "variant": variant.strip(), "quantity": quantity,
@@ -111,6 +210,8 @@ def normalize_cart(payload: Any, max_items: int) -> dict[str, Any]:
                 "price_text": price_text, "price_label": _text(row.get("priceDes"), 80),
                 "selected": row.get("checked") if type(row.get("checked")) is bool else None,
                 "shop": _text(vendor.get("title"), 120),
+                "kind": "bundle" if row.get("itemType") == 4 else "product",
+                "components": components, "gifts": gifts,
             })
     if not items and not empty:
         return cart_failure("unrecognized_cart_response")
@@ -118,15 +219,24 @@ def normalize_cart(payload: Any, max_items: int) -> dict[str, Any]:
         return cart_failure("unrecognized_cart_response")
     page = business.get("page")
     pages = page.get("totalPageNum") if isinstance(page, dict) else None
-    partial |= (not empty and (type(pages) is not int or pages > 1)) or len(items) > max_items
+    reported_count = cart_info.get("cartShowNum") if isinstance(cart_info, dict) else None
+    count_mismatch = type(reported_count) is int and reported_count != len(items)
+    partial |= (not empty and (type(pages) is not int or pages != 1)) or len(items) > max_items
+    partial |= not details_complete or count_mismatch
     balance = business.get("balanceInfo")
     selected_total = _money(balance.get("priceShow")) if isinstance(balance, dict) else None
+    returned = items[:max_items]
+    component_count, gift_count, gift_quantity = _nested_counts(returned)
     return {
         "success": True, "platform": "jd", "status": "partial" if partial else "empty" if empty else "ok",
-        "items": items[:max_items], "count": min(len(items), max_items), "partial": partial,
+        "items": returned, "count": len(returned), "partial": partial,
+        "main_quantity": sum(i["quantity"] for i in returned) if all(i["quantity"] is not None for i in returned) else None,
+        "bundle_count": sum(i["kind"] == "bundle" for i in returned),
+        "component_count": component_count, "gift_count": gift_count, "gift_quantity": gift_quantity,
+        "details_complete": details_complete,
         "selected_total": selected_total, "currency": "CNY",
         "fetched_at": datetime.now(timezone.utc).isoformat(),
-        "note": "只读购物车。selected_total 仅为已勾选商品的页面估价；最终实付以结算页为准。partial=true 表示未返回全部条目。",
+        "note": "count 是主条目数，套装计为一个主条目；components 是套装内明细，gifts 是附属赠品。gift_count 是赠品明细条数，gift_quantity 是赠品件数。必须同时报告主条目和赠品；不能把 count 称为全部商品件数。组件价格未知时不能用单买参考价替代套装分摊价。selected_total 仅为已勾选商品估价，不重复加上组件或赠品。partial=true 或 details_complete=false 时不得称列表完整；最终实付以结算页为准。",
     }
 
 

@@ -15,10 +15,13 @@ def fixture():
     """A synthetic response with private fields that must never reach the client."""
     return {
         "success": True, "code": 0,
-        "resultData": {"isEmptyCart": False, "pin": "FAKE_ACCOUNT", "address": "FAKE_ADDRESS"},
+        "resultData": {"isEmptyCart": False, "pin": "FAKE_ACCOUNT", "address": "FAKE_ADDRESS",
+                       "cartInfo": {"cartShowNum": 1, "vendors": [{"vendorId": 1, "sorted": [{
+                           "itemType": 1, "item": {"Id": "123", "skuUuid": "FAKE_IDENTIFIER", "items": [], "giftGroupInfosShow": []},
+                       }]}]}},
         "businessData": {
             "page": {"totalPageNum": 1, "hashValue": "FAKE_SECRET"},
-            "cartPage": {"vendorList": [{"title": "Example store", "items": [{
+            "cartPage": {"vendorList": [{"vendorId": 1, "title": "Example store", "items": [{
                 "skuId": "123", "name": "Example product", "num": 2, "price": 49.50,
                 "priceShow": "¥49.50", "priceDes": "优惠价", "checked": True,
                 "propertyTags": {"color": "Black", "size": "Small", "c": "FAKE_INTERNAL"},
@@ -54,6 +57,7 @@ class CartContractTests(unittest.TestCase):
         data = fixture()
         data["resultData"]["isEmptyCart"] = True
         data["businessData"]["cartPage"]["vendorList"] = []
+        data["resultData"]["cartInfo"] = {"vendors": [], "cartShowNum": 0}
         self.assertEqual(normalize_cart(data, 50)["status"], "empty")
         data["resultData"]["isEmptyCart"] = False
         self.assertFalse(normalize_cart(data, 50)["success"])
@@ -61,6 +65,56 @@ class CartContractTests(unittest.TestCase):
                         {"success": True, "code": 0, "resultData": {}, "businessData": {}}):
             result = normalize_cart(invalid, 50)
             self.assertFalse(result["success"])
+            self.assertNotIn("FAKE_", json.dumps(result))
+
+    def test_bundle_components_and_gift_units_are_not_lost_or_double_counted(self):
+        data = fixture()
+        data["resultData"]["cartInfo"]["cartShowNum"] = 2
+        raw = data["resultData"]["cartInfo"]["vendors"][0]["sorted"]
+        raw[0]["item"]["giftGroupInfosShow"] = [{"giftNum": 3, "giftInfos": [
+            {"id": "456", "name": "Example sample", "giftNum": 2, "FAKE_PRIVATE": "FAKE_ACCOUNT"},
+            {"id": "789", "name": "Example bowl", "giftNum": 1},
+        ]}]
+        raw.append({"itemType": 4, "item": {"Id": "INTERNAL_BUNDLE_ID", "vskuId": "234",
+            "items": [{"itemType": 1, "item": {"Id": "123", "Name": "Example product", "Num": 1, "Price": 900}},
+                      {"itemType": 1, "item": {"Id": "345", "Name": "Example cans", "Num": 4, "Price": 80}}]}})
+        rows = data["businessData"]["cartPage"]["vendorList"][0]["items"]
+        rows[0]["num"] = 1
+        rows.append({"skuId": "234", "name": "Example bundle", "num": 1, "itemType": 4, "priceShow": "¥150.00"})
+        result = normalize_cart(data, 50)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(result["main_quantity"], 2)
+        self.assertEqual(result["bundle_count"], 1)
+        self.assertEqual(result["component_count"], 2)
+        self.assertEqual(result["gift_count"], 2)
+        self.assertEqual(result["gift_quantity"], 3)
+        self.assertEqual(result["selected_total"], 99)
+        self.assertEqual(result["items"][1]["unit_price"], 150)
+        self.assertEqual(result["items"][1]["components"][1]["quantity"], 4)
+        self.assertIsNone(result["items"][1]["components"][1]["unit_price"])
+        self.assertEqual(result["items"][0]["gifts"][0]["quantity"], 2)
+        self.assertNotIn("FAKE_", json.dumps(result))
+        self.assertNotIn("INTERNAL_BUNDLE_ID", json.dumps(result))
+
+    def test_missing_nested_details_and_count_mismatches_are_partial(self):
+        for reason in ("missing", "mismatch", "unknown-gift", "gift-count", "bundle"):
+            data = fixture()
+            info = data["resultData"]["cartInfo"]
+            raw = info["vendors"][0]["sorted"][0]["item"]
+            if reason == "missing":
+                del info["vendors"]
+            elif reason == "mismatch":
+                info["cartShowNum"] = 9
+            elif reason == "bundle":
+                data["businessData"]["cartPage"]["vendorList"][0]["items"][0]["itemType"] = 4
+            elif reason == "unknown-gift":
+                raw["Gifts"] = [{"private": "FAKE_ACCOUNT"}]
+            else:
+                raw["giftGroupInfosShow"] = [{"giftNum": 3, "giftInfos": [{"id": "456", "name": "Example gift", "giftNum": 1}]}]
+            result = normalize_cart(data, 50)
+            self.assertTrue(result["partial"], reason)
+            self.assertEqual(result["status"], "partial")
             self.assertNotIn("FAKE_", json.dumps(result))
 
     def test_partial_cart_marks_pagination_limits_and_skipped_rows(self):
