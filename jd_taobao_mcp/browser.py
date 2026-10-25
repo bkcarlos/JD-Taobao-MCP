@@ -52,6 +52,8 @@ class BrowserController:
         self._page: Page | None = None
         self._lock = asyncio.Lock()
         self.login_until = 0.0
+        self.login_navigation_blocked = False
+        self._login_expiry_task: asyncio.Task | None = None
 
     @property
     def lock(self) -> asyncio.Lock:
@@ -68,6 +70,9 @@ class BrowserController:
         request = route.request
         navigation = request.is_navigation_request()
         if not is_allowed_request(request.url, navigation=navigation):
+            if (navigation and self.login_until > time.monotonic() and self._page is not None
+                    and request.frame == self._page.main_frame):
+                self.login_navigation_blocked = True
             await route.abort("blockedbyclient")
             return
         try:
@@ -77,6 +82,9 @@ class BrowserController:
                 if 300 <= response.status < 400 and location:
                     target = urljoin(request.url, location)
                     if not is_allowed_request(target, navigation=navigation):
+                        if (navigation and self.login_until > time.monotonic() and self._page is not None
+                                and request.frame == self._page.main_frame):
+                            self.login_navigation_blocked = True
                         await route.abort("blockedbyclient")
                         return
                     # Chromium does not re-enter Playwright routing for an HTTP
@@ -228,7 +236,102 @@ class BrowserController:
         """Open only the official JD login page for a short-lived human session."""
         async with self._lock:
             self.login_until = deadline
-            await self._navigate_unlocked(await self._active_page_unlocked(), "https://passport.jd.com/new/login.aspx")
+            self.login_navigation_blocked = False
+            if self._login_expiry_task:
+                self._login_expiry_task.cancel()
+            self._login_expiry_task = asyncio.create_task(self._expire_login(deadline))
+            await self._navigate_unlocked(await self._active_page_unlocked(),
+                "https://passport.jd.com/new/login.aspx?ReturnUrl=https%3A%2F%2Fwww.jd.com%2F")
+
+    async def _expire_login(self, deadline: float) -> None:
+        """Stop the official login flow and clear transient input at the deadline."""
+        await asyncio.sleep(max(0, deadline - time.monotonic()))
+        async with self._lock:
+            if self.login_until == deadline:
+                try:
+                    if self._context is not None:
+                        cookies = await self._context.cookies()
+                        if likely_logged_in(cookies, "jd"):
+                            save_cookies(self.settings.profile_dir, cookies)
+                except (OSError, PlaywrightError):
+                    pass
+                finally:
+                    await self._end_login_unlocked()
+
+    async def _end_login_unlocked(self) -> None:
+        """Discard transient password/verification fields without deleting cookies."""
+        self.login_until = 0.0
+        if self._login_expiry_task and self._login_expiry_task is not asyncio.current_task():
+            self._login_expiry_task.cancel()
+        self._login_expiry_task = None
+        if self._page is not None:
+            with suppress(PlaywrightError):
+                await self._page.goto("about:blank")
+
+    async def end_login(self) -> None:
+        """Cancel human interaction and any outstanding QR polling in the page."""
+        async with self._lock:
+            await self._end_login_unlocked()
+
+    async def _human_login_page_unlocked(self) -> Page:
+        """Human interaction is confined to the fixed official login document."""
+        page = await self._active_page_unlocked()
+        if self.login_until <= time.monotonic() or not self._is_jd_login_page(page.url):
+            raise SafetyError("登录页已失效或跳转；请重新打开登录入口。")
+        return page
+
+    async def submit_password(self, username: str, password: str) -> None:
+        """Submit human-supplied credentials to JD's fixed form; never log or return them."""
+        async with self._lock:
+            page = await self._human_login_page_unlocked()
+            # Never choose an arbitrary form/selector supplied by the caller.
+            await page.locator("#formlogin #loginname").fill(username, timeout=5000)
+            await page.locator("#formlogin #nloginpwd").fill(password, timeout=5000)
+            if not self._is_jd_login_page(page.url):
+                raise SafetyError("登录页面已改变。")
+            await page.locator("#loginsubmit").click(timeout=5000)
+
+    async def human_login_view(self) -> bytes:
+        """Send a view only to the authenticated human, never to MCP or a screenshot file."""
+        async with self._lock:
+            page = await self._human_login_page_unlocked()
+            data = await page.screenshot(type="png", timeout=5000)
+            if not self._is_jd_login_page(page.url):
+                raise SafetyError("登录页面已改变。")
+            return data
+
+    async def human_login_pointer(self, points: list[dict[str, float]]) -> None:
+        """Replay only a person's bounded pointer gesture; do not infer or solve challenges."""
+        async with self._lock:
+            page = await self._human_login_page_unlocked()
+            viewport = page.viewport_size
+            if not viewport:
+                raise SafetyError("登录窗口尺寸不可用。")
+            await page.mouse.move(points[0]["x"]*viewport["width"], points[0]["y"]*viewport["height"])
+            await page.mouse.down()
+            try:
+                previous = points[0]["t"]
+                for point in points[1:]:
+                    if self.login_until <= time.monotonic() or not self._is_jd_login_page(page.url):
+                        raise SafetyError("登录页面已改变或过期。")
+                    await asyncio.sleep(min(0.1, max(0, (point["t"]-previous)/1000)))
+                    await page.mouse.move(point["x"]*viewport["width"], point["y"]*viewport["height"])
+                    previous = point["t"]
+            finally:
+                await page.mouse.up()
+
+    async def human_login_code(self, code: str) -> None:
+        """Fill only a focused non-password verification input selected by the human."""
+        async with self._lock:
+            page = await self._human_login_page_unlocked()
+            field = page.locator("input:focus")
+            if await field.count() != 1:
+                raise SafetyError("请先在京东页面中点选验证码输入框。")
+            kind = await field.get_attribute("type")
+            identity = await field.get_attribute("id")
+            if kind not in (None, "text", "tel", "number") or identity in {"loginname", "nloginpwd", "mobile-number"}:
+                raise SafetyError("这里只能填写验证码。")
+            await field.fill(code, timeout=3000)
 
     async def login_qr_png(self) -> bytes:
         """Render only JD's QR image to the authenticated human portal, never MCP."""
@@ -263,7 +366,7 @@ class BrowserController:
             if not likely_logged_in(cookies, "jd"):
                 return False
             save_cookies(self.settings.profile_dir, cookies)
-            self.login_until = 0.0
+            await self._end_login_unlocked()
             return True
 
     async def _links_unlocked(self, page: Page, limit: int) -> list[dict[str, str]]:

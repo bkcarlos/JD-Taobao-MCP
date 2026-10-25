@@ -64,7 +64,7 @@ async def browser_status() -> dict[str, Any]:
 
 @mcp.tool()
 async def begin_login(platform: str = "jd") -> dict[str, Any]:
-    """生成供用户本人打开的短时扫码链接，不返回二维码或 Cookie。仅支持京东。"""
+    """生成供用户本人打开的短时登录链接，支持扫码和账号密码；不要将密码或验证码传给 MCP。仅支持京东。"""
     if platform != "jd":
         raise ValueError("私有扫码入口目前仅支持京东。")
     if login_portal is None or "--http" not in sys.argv:

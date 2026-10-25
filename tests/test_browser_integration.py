@@ -4,6 +4,7 @@ import json
 import os
 import threading
 import tempfile
+import time
 from pathlib import Path
 import unittest
 from dataclasses import replace
@@ -52,7 +53,8 @@ class BrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
         from unittest.mock import AsyncMock
         from jd_taobao_mcp.login_portal import LoginPortal
         fake = SimpleNamespace(start_qr_login=AsyncMock(), checkpoint_login=AsyncMock(return_value=False),
-                               login_qr_png=AsyncMock(return_value=b"fixture"), login_until=0)
+                               login_qr_png=AsyncMock(return_value=b"fixture"), login_until=0, login_navigation_blocked=False,
+                               end_login=AsyncMock(),submit_password=AsyncMock(),human_login_view=AsyncMock(return_value=b"fixture"))
         sock = socket.socket()
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -86,11 +88,60 @@ class BrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(portal.session)
             await self.page.goto(portal.issue()["login_url"])
             await self.page.get_by_role("button",name="关闭入口",exact=True).click()
-            await self.page.get_by_text("入口已关闭，本次未确认登录成功。请重新生成链接并完成扫码。",exact=True).wait_for()
+            await self.page.get_by_text("入口已关闭，本次未确认登录成功。请重新生成链接并完成登录。",exact=True).wait_for()
+            fake.checkpoint_login.return_value=False
+            await self.page.goto(portal.issue()["login_url"])
+            await self.page.get_by_role("button",name="账号密码登录",exact=True).click()
+            if os.getenv("MCP_LOGIN_TEST_SCREENSHOT"):
+                await self.page.screenshot(path=str(Path(os.environ["MCP_LOGIN_TEST_SCREENSHOT"]).with_name("jd-password-form.png")))
+            await self.page.get_by_label("账号",exact=True).fill("FAKE_LOGIN_ACCOUNT")
+            await self.page.get_by_label("密码",exact=True).fill("FAKE_LOGIN_PASSWORD")
+            await self.page.get_by_role("button",name="登录",exact=True).click()
+            for _ in range(100):
+                if fake.submit_password.await_count:break
+                await asyncio.sleep(0.02)
+            fake.submit_password.assert_awaited_once_with("FAKE_LOGIN_ACCOUNT","FAKE_LOGIN_PASSWORD")
+            self.assertEqual(await self.page.get_by_label("密码",exact=True).input_value(),"")
+            await self.page.locator("#verification").wait_for(state="visible")
+            fake.checkpoint_login.return_value=True
+            await self.page.get_by_text("登录状态已保存，可以回到 Rakazo 查询商品。有效性以实际查询为准。",exact=True).wait_for(timeout=10000)
+            self.assertTrue(await self.page.locator("#verification").is_hidden())
         finally:
             server.should_exit=True
             await asyncio.wait_for(task,5)
             sock.close()
+
+    async def test_password_and_manual_controls_stay_on_fixed_login_document(self):
+        await self.context.route("**/*", lambda route: route.fulfill(content_type="text/html", body="""
+            <form id="formlogin" onsubmit="return false">
+              <input id="loginname"><input id="nloginpwd" type="password">
+              <button type="button" id="loginsubmit" onclick="window.submitted=(window.submitted||0)+1">Login</button>
+              <input id="authcode">
+            </form>"""))
+        await self.page.goto("https://passport.jd.com/new/login.aspx")
+        controller=BrowserController(Settings.from_env())
+        controller._context=self.context
+        controller._page=self.page
+        controller.login_until=time.monotonic()+60
+        await controller.submit_password("FAKE_USER","FAKE_PASSWORD")
+        self.assertEqual(await self.page.locator('#loginname').input_value(),'FAKE_USER')
+        self.assertEqual(await self.page.locator('#nloginpwd').input_value(),'FAKE_PASSWORD')
+        self.assertEqual(await self.page.evaluate('window.submitted'),1)
+        self.assertTrue((await controller.human_login_view()).startswith(b'\x89PNG'))
+        await self.page.locator('#nloginpwd').focus()
+        from jd_taobao_mcp.safety import SafetyError
+        with self.assertRaises(SafetyError):await controller.human_login_code('123456')
+        await self.page.locator('#authcode').focus()
+        await controller.human_login_code('123456')
+        self.assertEqual(await self.page.locator('#authcode').input_value(),'123456')
+        box=await self.page.locator('#loginsubmit').bounding_box()
+        size=self.page.viewport_size
+        await controller.human_login_pointer([{'x':(box['x']+box['width']/2)/size['width'],
+                                               'y':(box['y']+box['height']/2)/size['height'],'t':0}])
+        self.assertEqual(await self.page.evaluate('window.submitted'),2)
+        await controller.end_login()
+        self.assertEqual(self.page.url,'about:blank')
+        with self.assertRaises(SafetyError):await controller.human_login_view()
 
     async def test_saved_session_cookie_survives_browser_restart(self):
         with tempfile.TemporaryDirectory() as tmp:

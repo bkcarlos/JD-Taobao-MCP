@@ -292,7 +292,7 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         import server
         names = {t.name for t in await server.mcp.list_tools()}
         self.assertTrue({"search_products", "get_product_detail", "check_login"} <= names)
-        self.assertFalse({"type_into_element", "take_screenshot", "go_back"} & names)
+        self.assertFalse({"type_into_element", "take_screenshot", "go_back", "submit_password", "human_login_view", "human_login_pointer", "human_login_code"} & names)
         self.assertEqual(server.mcp.settings.host, "127.0.0.1")
 
     async def test_generic_navigation_cannot_call_login_endpoints(self):

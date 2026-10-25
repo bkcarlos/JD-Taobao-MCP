@@ -1,8 +1,9 @@
-"""Short-lived, human-only QR portal separate from bearer-protected MCP routes."""
+"""Short-lived human login portal separate from bearer-protected MCP routes."""
 from __future__ import annotations
 
 import asyncio
 import json
+import math
 import secrets
 import time
 from dataclasses import dataclass
@@ -24,6 +25,8 @@ class LoginSession:
     expires: float
     cookie: str = ""
     phase: str = "ready"
+    method: str = "qr"
+    password_attempts: int = 0
 
 
 class LoginPortal:
@@ -50,18 +53,22 @@ class LoginPortal:
             Route("/login/", self.page),
             Route("/login/session", self.exchange, methods=["POST"]),
             Route("/login/start", self.start, methods=["POST"]),
+            Route("/login/password", self.password, methods=["POST"]),
+            Route("/login/view", self.view),
+            Route("/login/pointer", self.pointer, methods=["POST"]),
+            Route("/login/code", self.code, methods=["POST"]),
             Route("/login/status", self.status),
             Route("/login/qr", self.qr),
             Route("/login/close", self.close, methods=["POST"]),
         ])
 
     def issue(self) -> dict:
-        """Issue a QR-only capability, never the MCP token or account credentials."""
+        """Issue a human-login capability, never the MCP token or account credentials."""
         if self.session and self.session.expires > time.monotonic() and self.session.phase == "waiting":
             raise SafetyError("已有扫码页面正在使用，请完成或关闭后再申请入口。")
         self.session = LoginSession(secrets.token_urlsafe(32), time.monotonic() + 600)
         return {"login_url": self.base_url + "#" + self.session.ticket, "expires_in_seconds": 600,
-                "platform": "jd", "message": "请本人打开链接，用京东 App 扫码并确认。链接仅限一次打开，10 分钟内有效。不要将二维码发送给模型。"}
+                "platform": "jd", "message": "请本人打开链接，选择扫码或账号密码登录。链接仅限一次打开，10 分钟内有效。密码、验证码和页面只能由本人在私有入口操作，不要发送给模型。"}
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -134,11 +141,125 @@ class LoginPortal:
             if self.session.phase == "saved":
                 return JSONResponse({"status": "saved"})
             self.session.phase = "waiting"
+            self.session.method = "qr"
             try:
                 await self.browser.start_qr_login(self.session.expires)
             except (SafetyError, PlaywrightError):
                 return JSONResponse({"error": "无法打开京东登录页，请稍后重试。"}, status_code=503)
             return JSONResponse({"status": "waiting"})
+
+    async def _body(self, request: Request, limit: int = 8192) -> dict:
+        """Read a bounded object without request-body logs or value-bearing errors."""
+        raw = bytearray()
+        async for chunk in request.stream():
+            raw.extend(chunk)
+            if len(raw) > limit:
+                raise ValueError("Request too large")
+        try:
+            data = json.loads(raw)
+        finally:
+            raw.clear()
+        if not isinstance(data, dict):
+            raise ValueError("Invalid request")
+        return data
+
+    async def password(self, request: Request) -> Response:
+        """Accept credentials only through the human session, never an MCP tool."""
+        async with self.lock:
+            if not self.authorized(request):
+                return JSONResponse({"error": "登录页已过期，请重新生成链接。"}, status_code=401)
+            assert self.session is not None
+            if self.session.phase == "saved":
+                return JSONResponse({"status": "saved"})
+            if self.session.password_attempts >= 3:
+                return JSONResponse({"error": "本次入口提交次数已达上限，请关闭入口后重新生成链接。"}, status_code=429)
+            data = {}
+            username = password = ""
+            try:
+                data = await self._body(request)
+                username, password = data.get("username"), data.get("password")
+                if (not isinstance(username, str) or not isinstance(password, str)
+                        or not 1 <= len(username.strip()) <= 256 or not 1 <= len(password) <= 256
+                        or any(ord(c) < 32 for c in username+password)):
+                    raise ValueError("Invalid credentials")
+                self.session.password_attempts += 1
+                self.session.phase = "waiting"
+                self.session.method = "password"
+                await self.browser.start_qr_login(self.session.expires)
+                await self.browser.submit_password(username.strip(), password)
+                return JSONResponse({"status": "waiting", "method": "password"})
+            except (ValueError, TypeError):
+                return JSONResponse({"error": "请输入有效的账号和密码。"}, status_code=400)
+            except (SafetyError, PlaywrightError):
+                return JSONResponse({"error": "提交未完成，请在下方京东页面查看并处理验证。"}, status_code=409)
+            finally:
+                # Immutable strings cannot be securely zeroed; keep no stored references.
+                data.clear()
+                username = password = ""
+
+    async def view(self, request: Request) -> Response:
+        """Expose the official login document only to the authenticated human."""
+        async with self.lock:
+            if not self.authorized(request):
+                return Response(status_code=401)
+            assert self.session is not None
+            if self.session.phase != "waiting":
+                return Response(status_code=409)
+            try:
+                return Response(await self.browser.human_login_view(), media_type="image/png")
+            except (SafetyError, PlaywrightError):
+                return JSONResponse({"error": "登录页面已跳转或过期，请检查登录状态。"}, status_code=409)
+
+    async def pointer(self, request: Request) -> Response:
+        """Forward a human click/drag in the official login view; never solve a challenge."""
+        async with self.lock:
+            if not self.authorized(request):
+                return JSONResponse({"error": "登录页已过期。"}, status_code=401)
+            assert self.session is not None
+            if self.session.phase != "waiting":
+                return JSONResponse({"error": "请先开始登录。"}, status_code=409)
+            try:
+                points = (await self._body(request)).get("points")
+                if not isinstance(points, list) or not 1 <= len(points) <= 80:
+                    raise ValueError()
+                previous = -1
+                for point in points:
+                    if not isinstance(point, dict) or set(point) != {"x", "y", "t"}:
+                        raise ValueError()
+                    if any(type(v) not in (int, float) or not math.isfinite(v) for v in point.values()):
+                        raise ValueError()
+                    if not (0 <= point["x"] <= 1 and 0 <= point["y"] <= 1 and 0 <= point["t"] <= 12000 and previous <= point["t"]):
+                        raise ValueError()
+                    previous = point["t"]
+                await self.browser.human_login_pointer(points)
+                return JSONResponse({"ok": True})
+            except (ValueError, TypeError, OverflowError):
+                return JSONResponse({"error": "无效的鼠标操作。"}, status_code=400)
+            except (SafetyError, PlaywrightError):
+                return JSONResponse({"error": "操作未完成，请重新查看登录页面。"}, status_code=409)
+
+    async def code(self, request: Request) -> Response:
+        """Deliver human-entered verification text without retaining or echoing it."""
+        async with self.lock:
+            if not self.authorized(request):
+                return JSONResponse({"error": "登录页已过期。"}, status_code=401)
+            assert self.session is not None
+            if self.session.phase != "waiting":
+                return JSONResponse({"error": "请先开始登录。"}, status_code=409)
+            data = {}
+            try:
+                data = await self._body(request)
+                value = data.get("code")
+                if not isinstance(value, str) or not 1 <= len(value) <= 16 or not value.isascii() or not value.isalnum():
+                    raise ValueError()
+                await self.browser.human_login_code(value)
+                return JSONResponse({"ok": True})
+            except (ValueError, TypeError):
+                return JSONResponse({"error": "请输入有效验证码。"}, status_code=400)
+            except (SafetyError, PlaywrightError):
+                return JSONResponse({"error": "请先在京东页面点选验证码输入框，再填入验证码。"}, status_code=409)
+            finally:
+                data.clear()
 
     async def status(self, request: Request) -> Response:
         """Checkpoint only a detected login; return no cookies, names or account IDs."""
@@ -152,7 +273,8 @@ class LoginPortal:
                         self.session.phase = "saved"
                 except (OSError, SafetyError, PlaywrightError):
                     return JSONResponse({"error": "登录状态未保存，请重试。"}, status_code=503)
-            return JSONResponse({"status": self.session.phase})
+            return JSONResponse({"status": self.session.phase, "method": self.session.method,
+                                 "navigation_blocked": self.browser.login_navigation_blocked})
 
     async def qr(self, request: Request) -> Response:
         """Return a QR crop to the authenticated human only, without a generic screenshot API."""
@@ -179,7 +301,7 @@ class LoginPortal:
                     saved = await self.browser.checkpoint_login()
                 except (OSError, SafetyError, PlaywrightError):
                     return JSONResponse({"error": "登录状态未保存，请重试关闭。"}, status_code=503)
-            self.browser.login_until = 0.0
+            await self.browser.end_login()
             self.session = None
             response = JSONResponse({"ok": True, "login_saved": saved})
             response.delete_cookie("shopping_login", path="/login", secure=self.secure, httponly=True, samesite="strict")
@@ -198,18 +320,38 @@ class WithLoginPortal:
         await target(scope, receive, send)
 
 
-_HTML = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>京东扫码登录</title>
-<style nonce="NONCE">body{font:16px system-ui;max-width:420px;margin:8vh auto;padding:24px;color:#171717;background:#fafafa}main{background:white;border:1px solid #ddd;border-radius:16px;padding:28px}h1{font-size:24px}button{font:inherit;padding:10px 16px;margin:8px 6px 8px 0;border:1px solid #999;border-radius:8px;background:white;cursor:pointer}button:disabled{opacity:.45}img{display:block;width:220px;height:220px;margin:24px auto;image-rendering:pixelated}img[hidden]{display:none}p{line-height:1.6;color:#555}</style></head><body><main><h1>京东扫码登录</h1><p id="status" role="status">正在验证入口…</p><img id="qr" hidden alt="京东登录二维码"><button id="start" disabled>显示二维码</button><button id="close" disabled>关闭入口</button></main>
-<script nonce="NONCE">
-const status=document.querySelector('#status'),qr=document.querySelector('#qr'),start=document.querySelector('#start'),close=document.querySelector('#close');
-let stopped=false,objectUrl=null,timer=null,misses=0;
+_HTML = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>京东登录</title>
+<style nonce="NONCE">
+*{box-sizing:border-box}body{font:16px system-ui;margin:5vh auto;padding:20px;color:#171717;background:#fafafa;max-width:980px}main{max-width:460px;margin:auto;background:white;border:1px solid #ddd;border-radius:16px;padding:24px}body.wide main{max-width:940px}h1{font-size:24px;margin-top:0}button,input{font:inherit;padding:10px 14px;border:1px solid #999;border-radius:8px}button{margin:6px 6px 6px 0;background:white;cursor:pointer}button:disabled{opacity:.45}input{width:100%;margin:6px 0 12px}label{display:block}p{line-height:1.6;color:#555}small{display:block;line-height:1.5;color:#555}#qr{display:block;width:220px;max-width:100%;height:auto;margin:24px auto;image-rendering:pixelated}#view{display:block;width:100%;height:auto;touch-action:none;user-select:none;cursor:crosshair;border:0}#verification{border-top:1px solid #ddd;margin-top:18px;padding-top:16px}#credentials{max-width:410px}#code{max-width:220px;display:inline-block}h2{font-size:18px}[hidden]{display:none!important}
+</style></head><body><main><h1>京东登录</h1><p id="status" role="status">正在验证入口…</p>
+<div><button id="start" disabled>显示二维码</button><button id="passwordMode" disabled>账号密码登录</button></div>
+<img id="qr" hidden alt="京东登录二维码">
+<form id="credentials" hidden><p>账号密码仅提交到你的私有登录服务，由服务器上的京东官方页面处理；不写入日志或发送给模型。</p><label for="username">账号</label><input id="username" autocomplete="username" maxlength="256" required><label for="password">密码</label><input id="password" type="password" autocomplete="current-password" maxlength="256" required><button id="submitPassword" type="submit">登录</button></form>
+<button id="showView" hidden>查看京东验证页面</button>
+<section id="verification" hidden><h2>京东官方登录页面</h2><p>如需滑块或验证码，请本人在下方操作。点击验证码输入框后，可填入验证码。</p><img id="view" alt="京东官方登录页面，仅供本人操作" draggable="false"><div><label for="code">验证码</label><input id="code" autocomplete="one-time-code" maxlength="16"><button id="sendCode">填入验证码</button></div></section>
+<button id="close" disabled>关闭入口</button></main><script nonce="NONCE">
+const el=id=>document.getElementById(id),status=el('status'),qr=el('qr'),view=el('view'),start=el('start'),close=el('close'),mode=el('passwordMode'),form=el('credentials'),showView=el('showView'),verification=el('verification');
+let stopped=false,timer=null,epoch=0,qrUrl=null,viewUrl=null,misses=0,method='qr',inAction=false,gesture=null;
 const ticket=location.hash.slice(1);history.replaceState(null,'','/login');
 window.addEventListener('hashchange',()=>{if(location.hash)location.reload();});
-async function api(path,body){const r=await fetch('/login/'+path,{method:body?'POST':'GET',credentials:'same-origin',cache:'no-store',headers:body?{'Content-Type':'application/json','X-Login-Action':'1'}:{},body:body?JSON.stringify(body):undefined});const data=await r.json();if(!r.ok)throw Error(data.error||'登录页已过期，请重新生成链接。');return data;}
-function hide(){qr.hidden=true;if(objectUrl){URL.revokeObjectURL(objectUrl);objectUrl=null;}}
-function fail(e){status.textContent=e.message;stopped=true;clearTimeout(timer);hide();}
-async function poll(){if(stopped)return;try{const s=await api('status');if(s.status==='saved'){status.textContent='登录状态已保存，可以回到 Rakazo 查询商品。有效性以实际查询为准。';hide();start.disabled=true;stopped=true;return;}if(s.status==='waiting'){const r=await fetch('/login/qr',{credentials:'same-origin',cache:'no-store'});if(r.ok){const next=URL.createObjectURL(await r.blob());if(objectUrl)URL.revokeObjectURL(objectUrl);objectUrl=next;qr.src=next;qr.hidden=false;misses=0;status.textContent='用京东 App 扫码，并在手机上确认。';}else{hide();if(++misses>3)status.textContent='二维码尚未就绪、已过期或需人工验证。可尝试刷新二维码。';}}timer=setTimeout(poll,3000);}catch(e){fail(e);}}
-start.onclick=async()=>{start.disabled=true;clearTimeout(timer);stopped=true;hide();status.textContent='正在加载京东二维码…';try{const r=await api('start',{});if(r.status==='saved'){status.textContent='登录状态已保存。';return;}stopped=false;start.textContent='刷新二维码';await poll();}catch(e){fail(e);}finally{if(!stopped)start.disabled=false;else if(!status.textContent.includes('已保存'))start.disabled=false;}};
-close.onclick=async()=>{try{const result=await api('close',{});stopped=true;clearTimeout(timer);hide();start.disabled=true;close.disabled=true;status.textContent=result.login_saved?'入口已关闭，登录状态已保存。':'入口已关闭，本次未确认登录成功。请重新生成链接并完成扫码。';}catch(e){fail(e);}};
-(async()=>{try{if(ticket)await api('session',{ticket});const s=await api('status');close.disabled=false;if(s.status==='saved'){status.textContent='登录状态已保存，可以回到 Rakazo。';return;}start.disabled=false;status.textContent='二维码仅供你本人扫码。入口 10 分钟内有效。';if(s.status==='waiting'){start.textContent='刷新二维码';poll();}}catch(e){fail(e);}})();
-</script></body></html>'''
+async function api(path,body){const response=await fetch('/login/'+path,{method:body?'POST':'GET',credentials:'same-origin',cache:'no-store',headers:body?{'Content-Type':'application/json','X-Login-Action':'1'}:{},body:body?JSON.stringify(body):undefined});const data=await response.json();if(!response.ok)throw Error(data.error||'登录页已过期，请重新生成链接。');return data;}
+function hideQr(){qr.hidden=true;if(qrUrl){URL.revokeObjectURL(qrUrl);qrUrl=null;}}
+function clearView(){verification.hidden=true;document.body.classList.remove('wide');if(viewUrl){URL.revokeObjectURL(viewUrl);viewUrl=null;}}
+function stop(){stopped=true;epoch++;clearTimeout(timer);hideQr();clearView();el('password').value='';el('code').value='';}
+function saved(){stop();form.hidden=true;start.disabled=true;mode.disabled=true;showView.hidden=true;status.textContent='登录状态已保存，可以回到 Rakazo 查询商品。有效性以实际查询为准。';}
+async function refreshView(){if(gesture||inAction||verification.hidden||stopped)return;const response=await fetch('/login/view',{credentials:'same-origin',cache:'no-store'});if(response.ok){const next=URL.createObjectURL(await response.blob());if(viewUrl)URL.revokeObjectURL(viewUrl);viewUrl=next;view.src=next;}else{const error=await response.json().catch(()=>({}));status.textContent=error.error||'验证页面不可用，请重新生成登录链接。';if(response.status===401)stop();}}
+async function poll(mine=epoch){if(stopped||mine!==epoch)return;try{const state=await api('status');if(stopped||mine!==epoch)return;if(state.status==='saved'){saved();return;}method=state.method||method;if(state.status==='waiting'){showView.hidden=false;if(state.navigation_blocked){status.textContent='京东登录跳转被安全规则阻止，尚未完成登录。请联系管理员。';hideQr();}else if(method==='qr'&&verification.hidden){const response=await fetch('/login/qr',{credentials:'same-origin',cache:'no-store'});if(stopped||mine!==epoch)return;if(response.ok){const next=URL.createObjectURL(await response.blob());if(qrUrl)URL.revokeObjectURL(qrUrl);qrUrl=next;qr.src=next;qr.hidden=false;misses=0;status.textContent='用京东 App 扫码，并在手机上确认；等待这里显示登录状态已保存。';}else{hideQr();if(++misses>3)status.textContent='尚未检测到登录。可打开京东验证页面查看是否需要确认或验证。';}}await refreshView();}if(!stopped&&mine===epoch)timer=setTimeout(()=>poll(mine),3000);}catch(error){if(mine===epoch){stop();status.textContent=error.message;}}}
+start.onclick=async()=>{stop();form.hidden=true;el('username').value='';start.disabled=true;mode.disabled=true;status.textContent='正在加载京东二维码…';try{const state=await api('start',{});if(state.status==='saved'){saved();return;}method='qr';stopped=false;start.textContent='刷新二维码';await poll();}catch(error){status.textContent=error.message;}finally{start.disabled=false;mode.disabled=false;}};
+mode.onclick=()=>{hideQr();form.hidden=false;el('username').focus();};
+form.onsubmit=async(event)=>{event.preventDefault();const credentials={username:el('username').value,password:el('password').value};stop();start.disabled=true;mode.disabled=true;el('submitPassword').disabled=true;el('password').value='';status.textContent='正在向京东提交登录，请稍候…';let message='请在下方京东页面完成可能出现的验证，并等待登录状态已保存。';try{const state=await api('password',credentials);if(state.status==='saved'){saved();return;}}catch(error){message=error.message;}finally{credentials.password='';credentials.username='';el('username').value='';start.disabled=false;mode.disabled=false;el('submitPassword').disabled=false;}method='password';stopped=false;verification.hidden=false;document.body.classList.add('wide');showView.hidden=false;status.textContent=message;await poll();};
+showView.onclick=async()=>{verification.hidden=false;hideQr();document.body.classList.add('wide');await refreshView();};
+function point(event){const box=view.getBoundingClientRect();return{x:Math.max(0,Math.min(1,(event.clientX-box.left)/box.width)),y:Math.max(0,Math.min(1,(event.clientY-box.top)/box.height)),t:Math.round(performance.now()-gesture.started)};}
+view.onpointerdown=event=>{if(inAction||stopped||event.button!==0)return;event.preventDefault();gesture={started:performance.now(),points:[]};gesture.points.push(point(event));view.setPointerCapture(event.pointerId);};
+view.onpointermove=event=>{if(!gesture)return;const next=point(event),last=gesture.points[gesture.points.length-1];if(gesture.points.length<79&&next.t-last.t>=30)gesture.points.push(next);};
+view.onpointerup=async event=>{if(!gesture)return;gesture.points.push(point(event));const points=gesture.points;gesture=null;if(view.hasPointerCapture(event.pointerId))view.releasePointerCapture(event.pointerId);inAction=true;try{await api('pointer',{points});}catch(error){status.textContent=error.message;}finally{inAction=false;await refreshView();}};
+view.onpointercancel=()=>{gesture=null;};
+el('sendCode').onclick=async()=>{const payload={code:el('code').value};el('code').value='';inAction=true;try{await api('code',payload);}catch(error){status.textContent=error.message;}finally{payload.code='';inAction=false;await refreshView();}};
+close.onclick=async()=>{try{const result=await api('close',{});stop();form.hidden=true;start.disabled=true;mode.disabled=true;showView.hidden=true;close.disabled=true;status.textContent=result.login_saved?'入口已关闭，登录状态已保存。':'入口已关闭，本次未确认登录成功。请重新生成链接并完成登录。';}catch(error){status.textContent=error.message;}};
+(async()=>{try{if(ticket)await api('session',{ticket});const state=await api('status');close.disabled=false;if(state.status==='saved'){saved();return;}start.disabled=false;mode.disabled=false;status.textContent='请选择登录方式。入口 10 分钟内有效。';if(state.status==='waiting'){method=state.method||'qr';start.textContent='刷新二维码';if(method==='password'){verification.hidden=false;document.body.classList.add('wide');}poll();}}catch(error){stop();status.textContent=error.message;}})();
+</script></body></html>
+'''

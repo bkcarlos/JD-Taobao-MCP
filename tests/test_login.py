@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
+from playwright.async_api import Error as PlaywrightError
 
 from jd_taobao_mcp.browser import BrowserController
 from jd_taobao_mcp.config import Settings
@@ -57,7 +58,9 @@ class StateTests(unittest.TestCase):
 class PortalTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.browser = SimpleNamespace(start_qr_login=AsyncMock(), checkpoint_login=AsyncMock(return_value=False),
-                                       login_qr_png=AsyncMock(return_value=b"fake-qr"), login_until=0)
+                                       login_qr_png=AsyncMock(return_value=b"fake-qr"), login_until=0, login_navigation_blocked=False,
+                                       end_login=AsyncMock(), submit_password=AsyncMock(),human_login_view=AsyncMock(return_value=b"fake-view"),
+                                       human_login_pointer=AsyncMock(),human_login_code=AsyncMock())
         self.portal = LoginPortal(self.browser, "https://login.example.test/login")
         self.headers = {"Origin":"https://login.example.test", "X-Login-Action":"1"}
         async def inner(scope, receive, send):
@@ -131,6 +134,58 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(closed.json()['login_saved'])
             self.assertIsNone(self.portal.session)
 
+    async def test_password_is_human_only_bounded_and_never_echoed(self):
+        payload={"username":"FAKE_USER","password":"FAKE_PRIVATE_PASSWORD"}
+        for path in ('password','pointer','code'):
+            response=await self.client.post('/login/'+path,json=payload,headers=self.headers)
+            self.assertEqual(response.status_code,401)
+        self.assertEqual((await self.client.get('/login/view')).status_code,401)
+        await self.authorize()
+        response=await self.client.post('/login/password',json=payload)
+        self.assertEqual(response.status_code,403)
+        self.browser.submit_password.assert_not_awaited()
+        response=await self.client.post('/login/password',json={**payload,"password":"x"*257},headers=self.headers)
+        self.assertEqual(response.status_code,400)
+        response=await self.client.post('/login/password',content=b'x'*9000,headers=self.headers)
+        self.assertEqual(response.status_code,400)
+        self.browser.submit_password.side_effect=PlaywrightError('FAKE_PRIVATE_PASSWORD')
+        response=await self.client.post('/login/password',json=payload,headers=self.headers)
+        self.assertEqual(response.status_code,409)
+        self.assertNotIn('FAKE_',response.text)
+        self.browser.submit_password.side_effect=None
+        for _ in range(2):
+            response=await self.client.post('/login/password',json=payload,headers=self.headers)
+            self.assertEqual(response.status_code,200)
+            self.assertNotIn('FAKE_',response.text)
+        self.browser.submit_password.assert_awaited_with('FAKE_USER','FAKE_PRIVATE_PASSWORD')
+        response=await self.client.post('/login/password',json=payload,headers=self.headers)
+        self.assertEqual(response.status_code,429)
+        self.assertEqual((await self.client.get('/login/status')).json()['method'],'password')
+        view=await self.client.get('/login/view')
+        self.assertEqual(view.content,b'fake-view')
+        self.assertEqual(view.headers['cache-control'],'no-store')
+
+    async def test_manual_gestures_and_codes_are_scoped_and_validated(self):
+        await self.authorize()
+        points=[{"x":0.1,"y":0.2,"t":0},{"x":0.5,"y":0.2,"t":350}]
+        self.assertEqual((await self.client.post('/login/pointer',json={"points":points},headers=self.headers)).status_code,409)
+        await self.client.post('/login/start',json={},headers=self.headers)
+        for invalid in ([],points*41,[{"x":-1,"y":0,"t":0}],[{"x":0,"y":0,"t":-1}],
+                        [{"x":0,"y":0,"t":15000}],[{"x":0,"y":0,"t":0,"selector":"button"}]):
+            response=await self.client.post('/login/pointer',json={"points":invalid},headers=self.headers)
+            self.assertEqual(response.status_code,400)
+        response=await self.client.post('/login/pointer',json={"points":points},headers=self.headers)
+        self.assertEqual(response.status_code,200)
+        self.browser.human_login_pointer.assert_awaited_once_with(points)
+        self.assertEqual((await self.client.post('/login/code',json={"code":"invalid code"},headers=self.headers)).status_code,400)
+        response=await self.client.post('/login/code',json={"code":"123456"},headers=self.headers)
+        self.assertEqual(response.status_code,200)
+        self.assertNotIn('123456',response.text)
+        self.browser.human_login_code.assert_awaited_once_with('123456')
+        await self.client.post('/login/close',json={},headers=self.headers)
+        self.assertEqual((await self.client.get('/login/view')).status_code,401)
+        self.browser.end_login.assert_awaited_once()
+
     async def test_invalid_public_url_is_rejected(self):
         for url in ('http://public.example/login','https://user:pass@example.test/login',
                     'https://example.test/login?token=x','https://example.test/other','https://example.test/login#x'):
@@ -150,6 +205,35 @@ class BrowserLoginTests(unittest.IsolatedAsyncioTestCase):
             second=BrowserController(settings)
             self.assertTrue(likely_logged_in(load_cookies(second.settings.profile_dir),'jd'))
             self.assertEqual(first.login_until,0)
+
+    async def test_human_controls_reject_non_login_pages_and_expired_sessions(self):
+        c=BrowserController(Settings.from_env());c.login_until=time.monotonic()+600
+        page=SimpleNamespace(url='https://order.jd.com/list',screenshot=AsyncMock())
+        c._active_page_unlocked=AsyncMock(return_value=page)
+        for call in (lambda:c.submit_password('FAKE_USER','FAKE_PASSWORD'),c.human_login_view,
+                     lambda:c.human_login_pointer([{"x":0,"y":0,"t":0}]),lambda:c.human_login_code('123456')):
+            with self.assertRaises(SafetyError):await call()
+        page.screenshot.assert_not_awaited()
+        page.url='https://passport.jd.com/new/login.aspx';c.login_until=time.monotonic()-1
+        with self.assertRaises(SafetyError):await c.human_login_view()
+
+    async def test_end_login_clears_transient_page_and_expiry_task(self):
+        c=BrowserController(Settings.from_env());c.login_until=time.monotonic()+600
+        c._page=SimpleNamespace(goto=AsyncMock())
+        c._login_expiry_task=asyncio.create_task(asyncio.sleep(600))
+        await c.end_login()
+        self.assertEqual(c.login_until,0)
+        self.assertIsNone(c._login_expiry_task)
+        c._page.goto.assert_awaited_once_with('about:blank')
+
+    async def test_expired_login_stops_the_official_page(self):
+        c=BrowserController(Settings.from_env())
+        c.login_until=time.monotonic()+0.01
+        c._context=SimpleNamespace(cookies=AsyncMock(return_value=[]))
+        c._page=SimpleNamespace(goto=AsyncMock())
+        await c._expire_login(c.login_until)
+        self.assertEqual(c.login_until,0)
+        c._page.goto.assert_awaited_once_with('about:blank')
 
     async def test_qr_capture_rejects_placeholder_or_other_page(self):
         c=BrowserController(Settings.from_env());c.login_until=time.monotonic()+600
