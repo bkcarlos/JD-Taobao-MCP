@@ -73,6 +73,13 @@ CAPTCHA solver; existing MFA and verification requirements remain in force. The 
 page, including transient password/code fields, is cleared on success, cancellation or
 expiry. Cookie persistence remains separate from password input.
 
+Live pointer events use the same authenticated human session and Origin checks as other
+portal actions. One gesture may hold the mouse button between requests, for at most
+15 seconds. Moves/releases must match that gesture; cancellation, login cleanup and a
+disconnect timeout release the button. Coordinates are bounded to the browser viewport.
+The human sees refreshed frames while dragging; no trajectory or solution is generated
+by the server, and the frames and input are not persisted or exposed to MCP.
+
 While that human session is active, main-frame GET navigation may also visit the exact
 HTTPS endpoint `sso.jd.com/setCookie`, used by JD's login script for its SSO cookie handoff.
 Every subsequent redirect is checked again. This exception does not permit other SSO

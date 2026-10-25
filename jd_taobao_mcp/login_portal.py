@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 import secrets
 import time
 from dataclasses import dataclass
@@ -55,7 +56,7 @@ class LoginPortal:
             Route("/login/start", self.start, methods=["POST"]),
             Route("/login/password", self.password, methods=["POST"]),
             Route("/login/view", self.view),
-            Route("/login/pointer", self.pointer, methods=["POST"]),
+            Route("/login/gesture", self.gesture, methods=["POST"]),
             Route("/login/code", self.code, methods=["POST"]),
             Route("/login/status", self.status),
             Route("/login/qr", self.qr),
@@ -210,8 +211,8 @@ class LoginPortal:
             except (SafetyError, PlaywrightError):
                 return JSONResponse({"error": "登录页面已跳转或过期，请检查登录状态。"}, status_code=409)
 
-    async def pointer(self, request: Request) -> Response:
-        """Forward a human click/drag in the official login view; never solve a challenge."""
+    async def gesture(self, request: Request) -> Response:
+        """Authenticate and bound live human pointer events; never synthesize a solution."""
         async with self.lock:
             if not self.authorized(request):
                 return JSONResponse({"error": "登录页已过期。"}, status_code=401)
@@ -219,24 +220,21 @@ class LoginPortal:
             if self.session.phase != "waiting":
                 return JSONResponse({"error": "请先开始登录。"}, status_code=409)
             try:
-                points = (await self._body(request)).get("points")
-                if not isinstance(points, list) or not 1 <= len(points) <= 80:
+                data = await self._body(request, limit=1024)
+                phase, gesture_id, point = data.get("phase"), data.get("id"), data.get("point")
+                if (set(data) != {"phase", "id", "point"}
+                        or phase not in ("down", "move", "up", "cancel") or not isinstance(gesture_id, str)
+                        or not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", gesture_id)
+                        or not isinstance(point, dict) or set(point) != {"x", "y"}
+                        or any(type(v) not in (int, float) or not math.isfinite(v) or not 0 <= v <= 1
+                               for v in point.values())):
                     raise ValueError()
-                previous = -1
-                for point in points:
-                    if not isinstance(point, dict) or set(point) != {"x", "y", "t"}:
-                        raise ValueError()
-                    if any(type(v) not in (int, float) or not math.isfinite(v) for v in point.values()):
-                        raise ValueError()
-                    if not (0 <= point["x"] <= 1 and 0 <= point["y"] <= 1 and 0 <= point["t"] <= 12000 and previous <= point["t"]):
-                        raise ValueError()
-                    previous = point["t"]
-                await self.browser.human_login_pointer(points)
+                await self.browser.human_login_gesture(phase, gesture_id, point)
                 return JSONResponse({"ok": True})
             except (ValueError, TypeError, OverflowError):
                 return JSONResponse({"error": "无效的鼠标操作。"}, status_code=400)
             except (SafetyError, PlaywrightError):
-                return JSONResponse({"error": "操作未完成，请重新查看登录页面。"}, status_code=409)
+                return JSONResponse({"error": "拖动已结束或页面已改变，请重新操作。"}, status_code=409)
 
     async def code(self, request: Request) -> Response:
         """Deliver human-entered verification text without retaining or echoing it."""
@@ -328,28 +326,79 @@ _HTML = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta n
 <img id="qr" hidden alt="京东登录二维码">
 <form id="credentials" hidden><p>账号密码仅提交到你的私有登录服务，由服务器上的京东官方页面处理；不写入日志或发送给模型。</p><label for="username">账号</label><input id="username" autocomplete="username" maxlength="256" required><label for="password">密码</label><input id="password" type="password" autocomplete="current-password" maxlength="256" required><button id="submitPassword" type="submit">登录</button></form>
 <button id="showView" hidden>查看京东验证页面</button>
-<section id="verification" hidden><h2>京东官方登录页面</h2><p>如需滑块或验证码，请本人在下方操作。点击验证码输入框后，可填入验证码。</p><img id="view" alt="京东官方登录页面，仅供本人操作" draggable="false"><div><label for="code">验证码</label><input id="code" autocomplete="one-time-code" maxlength="16"><button id="sendCode">填入验证码</button></div></section>
+<section id="verification" hidden><h2>京东官方登录页面</h2><p>可直接点击或拖动下方页面，画面会同步更新。点击验证码输入框后，可填入验证码。</p><img id="view" alt="京东官方登录页面，仅供本人操作" draggable="false"><div><label for="code">验证码</label><input id="code" autocomplete="one-time-code" maxlength="16"><button id="sendCode">填入验证码</button></div></section>
 <button id="close" disabled>关闭入口</button></main><script nonce="NONCE">
 const el=id=>document.getElementById(id),status=el('status'),qr=el('qr'),view=el('view'),start=el('start'),close=el('close'),mode=el('passwordMode'),form=el('credentials'),showView=el('showView'),verification=el('verification');
-let stopped=false,timer=null,epoch=0,qrUrl=null,viewUrl=null,misses=0,method='qr',inAction=false,gesture=null;
+let stopped=false,timer=null,epoch=0,qrUrl=null,viewUrl=null,misses=0,method='qr',inAction=false,gesture=null,viewLoading=false;
 const ticket=location.hash.slice(1);history.replaceState(null,'','/login');
 window.addEventListener('hashchange',()=>{if(location.hash)location.reload();});
-async function api(path,body){const response=await fetch('/login/'+path,{method:body?'POST':'GET',credentials:'same-origin',cache:'no-store',headers:body?{'Content-Type':'application/json','X-Login-Action':'1'}:{},body:body?JSON.stringify(body):undefined});const data=await response.json();if(!response.ok)throw Error(data.error||'登录页已过期，请重新生成链接。');return data;}
+async function api(path,body){
+  const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),path==='gesture'?8000:45000);
+  try{
+    const response=await fetch('/login/'+path,{method:body?'POST':'GET',credentials:'same-origin',cache:'no-store',signal:controller.signal,headers:body?{'Content-Type':'application/json','X-Login-Action':'1'}:{},body:body?JSON.stringify(body):undefined});
+    const data=await response.json();if(!response.ok)throw Error(data.error||'登录页已过期，请重新生成链接。');return data;
+  }catch(error){if(controller.signal.aborted)throw Error('连接超时，请重试。');throw error;}
+  finally{clearTimeout(timeout);}
+}
 function hideQr(){qr.hidden=true;if(qrUrl){URL.revokeObjectURL(qrUrl);qrUrl=null;}}
 function clearView(){verification.hidden=true;document.body.classList.remove('wide');if(viewUrl){URL.revokeObjectURL(viewUrl);viewUrl=null;}}
-function stop(){stopped=true;epoch++;clearTimeout(timer);hideQr();clearView();el('password').value='';el('code').value='';}
+function stop(){cancelGesture();stopped=true;epoch++;clearTimeout(timer);hideQr();clearView();el('password').value='';el('code').value='';}
 function saved(){stop();form.hidden=true;start.disabled=true;mode.disabled=true;showView.hidden=true;status.textContent='登录状态已保存，可以回到 Rakazo 查询商品。有效性以实际查询为准。';}
-async function refreshView(){if(gesture||inAction||verification.hidden||stopped)return;const response=await fetch('/login/view',{credentials:'same-origin',cache:'no-store'});if(response.ok){const next=URL.createObjectURL(await response.blob());if(viewUrl)URL.revokeObjectURL(viewUrl);viewUrl=next;view.src=next;}else{const error=await response.json().catch(()=>({}));status.textContent=error.error||'验证页面不可用，请重新生成登录链接。';if(response.status===401)stop();}}
+async function refreshView(live=false){
+  if(viewLoading||verification.hidden||stopped||(!live&&(gesture||inAction)))return;
+  const mine=epoch,controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),8000);viewLoading=true;
+  try{
+    const response=await fetch('/login/view',{credentials:'same-origin',cache:'no-store',signal:controller.signal});
+    if(response.ok){
+      const blob=await response.blob();
+      if(mine!==epoch||stopped||verification.hidden||(!live&&(gesture||inAction)))return;
+      const next=URL.createObjectURL(blob);if(viewUrl)URL.revokeObjectURL(viewUrl);viewUrl=next;view.src=next;
+    }else{
+      const error=await response.json().catch(()=>({}));
+      if(mine!==epoch||stopped)return;
+      status.textContent=error.error||'验证页面不可用，请重新生成登录链接。';if(response.status===401)stop();
+    }
+  }finally{clearTimeout(timeout);viewLoading=false;}
+}
 async function poll(mine=epoch){if(stopped||mine!==epoch)return;try{const state=await api('status');if(stopped||mine!==epoch)return;if(state.status==='saved'){saved();return;}method=state.method||method;if(state.status==='waiting'){showView.hidden=false;if(state.navigation_blocked){status.textContent='京东登录跳转被安全规则阻止，尚未完成登录。请联系管理员。';hideQr();}else if(method==='qr'&&verification.hidden){const response=await fetch('/login/qr',{credentials:'same-origin',cache:'no-store'});if(stopped||mine!==epoch)return;if(response.ok){const next=URL.createObjectURL(await response.blob());if(qrUrl)URL.revokeObjectURL(qrUrl);qrUrl=next;qr.src=next;qr.hidden=false;misses=0;status.textContent='用京东 App 扫码，并在手机上确认；等待这里显示登录状态已保存。';}else{hideQr();if(++misses>3)status.textContent='尚未检测到登录。可打开京东验证页面查看是否需要确认或验证。';}}await refreshView();}if(!stopped&&mine===epoch)timer=setTimeout(()=>poll(mine),3000);}catch(error){if(mine===epoch){stop();status.textContent=error.message;}}}
 start.onclick=async()=>{stop();form.hidden=true;el('username').value='';start.disabled=true;mode.disabled=true;status.textContent='正在加载京东二维码…';try{const state=await api('start',{});if(state.status==='saved'){saved();return;}method='qr';stopped=false;start.textContent='刷新二维码';await poll();}catch(error){status.textContent=error.message;}finally{start.disabled=false;mode.disabled=false;}};
 mode.onclick=()=>{hideQr();form.hidden=false;el('username').focus();};
 form.onsubmit=async(event)=>{event.preventDefault();const credentials={username:el('username').value,password:el('password').value};stop();start.disabled=true;mode.disabled=true;el('submitPassword').disabled=true;el('password').value='';status.textContent='正在向京东提交登录，请稍候…';let message='请在下方京东页面完成可能出现的验证，并等待登录状态已保存。';try{const state=await api('password',credentials);if(state.status==='saved'){saved();return;}}catch(error){message=error.message;}finally{credentials.password='';credentials.username='';el('username').value='';start.disabled=false;mode.disabled=false;el('submitPassword').disabled=false;}method='password';stopped=false;verification.hidden=false;document.body.classList.add('wide');showView.hidden=false;status.textContent=message;await poll();};
 showView.onclick=async()=>{verification.hidden=false;hideQr();document.body.classList.add('wide');await refreshView();};
-function point(event){const box=view.getBoundingClientRect();return{x:Math.max(0,Math.min(1,(event.clientX-box.left)/box.width)),y:Math.max(0,Math.min(1,(event.clientY-box.top)/box.height)),t:Math.round(performance.now()-gesture.started)};}
-view.onpointerdown=event=>{if(inAction||stopped||event.button!==0)return;event.preventDefault();gesture={started:performance.now(),points:[]};gesture.points.push(point(event));view.setPointerCapture(event.pointerId);};
-view.onpointermove=event=>{if(!gesture)return;const next=point(event),last=gesture.points[gesture.points.length-1];if(gesture.points.length<79&&next.t-last.t>=30)gesture.points.push(next);};
-view.onpointerup=async event=>{if(!gesture)return;gesture.points.push(point(event));const points=gesture.points;gesture=null;if(view.hasPointerCapture(event.pointerId))view.releasePointerCapture(event.pointerId);inAction=true;try{await api('pointer',{points});}catch(error){status.textContent=error.message;}finally{inAction=false;await refreshView();}};
-view.onpointercancel=()=>{gesture=null;};
+function point(event){const box=view.getBoundingClientRect();return{x:Math.max(0,Math.min(1,(event.clientX-box.left)/box.width)),y:Math.max(0,Math.min(1,(event.clientY-box.top)/box.height))};}
+function finishGesture(g){clearTimeout(g.timer);if(gesture===g){gesture=null;inAction=false;}if(view.hasPointerCapture(g.pointerId))view.releasePointerCapture(g.pointerId);}
+async function pumpGesture(g){
+  if(g.busy)return;g.busy=true;
+  try{
+    while(gesture===g&&(g.pending||g.finish)){
+      const phase=!g.started?'down':g.finish||'move',position=!g.started?g.first:g.latest;
+      g.started=true;g.pending=false;
+      await api('gesture',{phase,id:g.id,point:position});
+      if(phase==='up'||phase==='cancel'){finishGesture(g);break;}
+      await refreshView(true);
+    }
+  }catch(error){
+    status.textContent=error.message;
+    try{await api('gesture',{phase:'cancel',id:g.id,point:g.latest});}catch{}
+    finishGesture(g);
+  }finally{g.busy=false;try{await refreshView();}catch{status.textContent='画面更新失败，请重试。';}}
+}
+function cancelGesture(){if(!gesture)return;gesture.finish='cancel';void pumpGesture(gesture);}
+view.onpointerdown=event=>{
+  if(gesture||inAction||stopped||event.button!==0||!event.isPrimary)return;
+  event.preventDefault();const position=point(event);
+  const g={id:crypto.randomUUID(),pointerId:event.pointerId,first:position,latest:position,pending:true,started:false,busy:false,finish:null};
+  gesture=g;inAction=true;view.setPointerCapture(event.pointerId);
+  g.timer=setTimeout(()=>{if(gesture===g){status.textContent='拖动超时，请重新操作。';cancelGesture();}},14000);
+  void pumpGesture(g);
+};
+view.onpointermove=event=>{if(!gesture||gesture.pointerId!==event.pointerId||gesture.finish)return;event.preventDefault();gesture.latest=point(event);gesture.pending=true;void pumpGesture(gesture);};
+view.onpointerup=event=>{if(!gesture||gesture.pointerId!==event.pointerId)return;event.preventDefault();gesture.latest=point(event);gesture.finish='up';void pumpGesture(gesture);};
+view.onpointercancel=event=>{if(gesture?.pointerId===event.pointerId)cancelGesture();};
+view.onlostpointercapture=event=>{if(gesture?.pointerId===event.pointerId&&!gesture.finish)cancelGesture();};
+window.addEventListener('blur',cancelGesture);
+window.addEventListener('pagehide',cancelGesture);
+window.addEventListener('resize',cancelGesture);
 el('sendCode').onclick=async()=>{const payload={code:el('code').value};el('code').value='';inAction=true;try{await api('code',payload);}catch(error){status.textContent=error.message;}finally{payload.code='';inAction=false;await refreshView();}};
 close.onclick=async()=>{try{const result=await api('close',{});stop();form.hidden=true;start.disabled=true;mode.disabled=true;showView.hidden=true;close.disabled=true;status.textContent=result.login_saved?'入口已关闭，登录状态已保存。':'入口已关闭，本次未确认登录成功。请重新生成链接并完成登录。';}catch(error){status.textContent=error.message;}};
 (async()=>{try{if(ticket)await api('session',{ticket});const state=await api('status');close.disabled=false;if(state.status==='saved'){saved();return;}start.disabled=false;mode.disabled=false;status.textContent='请选择登录方式。入口 10 分钟内有效。';if(state.status==='waiting'){method=state.method||'qr';start.textContent='刷新二维码';if(method==='password'){verification.hidden=false;document.body.classList.add('wide');}poll();}}catch(error){stop();status.textContent=error.message;}})();

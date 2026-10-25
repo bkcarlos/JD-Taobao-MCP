@@ -82,7 +82,7 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         self.browser = SimpleNamespace(start_qr_login=AsyncMock(), checkpoint_login=AsyncMock(return_value=False),
                                        login_qr_png=AsyncMock(return_value=b"fake-qr"), login_until=0, login_navigation_blocked=False,
                                        end_login=AsyncMock(), submit_password=AsyncMock(),human_login_view=AsyncMock(return_value=b"fake-view"),
-                                       human_login_pointer=AsyncMock(),human_login_code=AsyncMock())
+                                       human_login_gesture=AsyncMock(),human_login_code=AsyncMock())
         self.portal = LoginPortal(self.browser, "https://login.example.test/login")
         self.headers = {"Origin":"https://login.example.test", "X-Login-Action":"1"}
         async def inner(scope, receive, send):
@@ -158,7 +158,7 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_password_is_human_only_bounded_and_never_echoed(self):
         payload={"username":"FAKE_USER","password":"FAKE_PRIVATE_PASSWORD"}
-        for path in ('password','pointer','code'):
+        for path in ('password','gesture','code'):
             response=await self.client.post('/login/'+path,json=payload,headers=self.headers)
             self.assertEqual(response.status_code,401)
         self.assertEqual((await self.client.get('/login/view')).status_code,401)
@@ -187,18 +187,9 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(view.content,b'fake-view')
         self.assertEqual(view.headers['cache-control'],'no-store')
 
-    async def test_manual_gestures_and_codes_are_scoped_and_validated(self):
+    async def test_manual_codes_are_scoped_and_validated(self):
         await self.authorize()
-        points=[{"x":0.1,"y":0.2,"t":0},{"x":0.5,"y":0.2,"t":350}]
-        self.assertEqual((await self.client.post('/login/pointer',json={"points":points},headers=self.headers)).status_code,409)
         await self.client.post('/login/start',json={},headers=self.headers)
-        for invalid in ([],points*41,[{"x":-1,"y":0,"t":0}],[{"x":0,"y":0,"t":-1}],
-                        [{"x":0,"y":0,"t":15000}],[{"x":0,"y":0,"t":0,"selector":"button"}]):
-            response=await self.client.post('/login/pointer',json={"points":invalid},headers=self.headers)
-            self.assertEqual(response.status_code,400)
-        response=await self.client.post('/login/pointer',json={"points":points},headers=self.headers)
-        self.assertEqual(response.status_code,200)
-        self.browser.human_login_pointer.assert_awaited_once_with(points)
         self.assertEqual((await self.client.post('/login/code',json={"code":"invalid code"},headers=self.headers)).status_code,400)
         response=await self.client.post('/login/code',json={"code":"123456"},headers=self.headers)
         self.assertEqual(response.status_code,200)
@@ -207,6 +198,27 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         await self.client.post('/login/close',json={},headers=self.headers)
         self.assertEqual((await self.client.get('/login/view')).status_code,401)
         self.browser.end_login.assert_awaited_once()
+
+    async def test_live_gesture_requires_session_origin_and_bounded_coordinates(self):
+        payload={"phase":"down","id":"fixture-gesture-id","point":{"x":0.2,"y":0.3}}
+        self.assertEqual((await self.client.post('/login/gesture',json=payload,headers=self.headers)).status_code,401)
+        await self.authorize()
+        self.assertEqual((await self.client.post('/login/gesture',json=payload,headers=self.headers)).status_code,409)
+        await self.client.post('/login/start',json={},headers=self.headers)
+        self.assertEqual((await self.client.post('/login/gesture',json=payload)).status_code,403)
+        for invalid in ({**payload,"phase":"script"},{**payload,"id":"short"},
+                        {**payload,"point":{"x":True,"y":0.3}},
+                        {**payload,"point":{"x":-0.1,"y":0.3}},
+                        {**payload,"point":{"x":0.1,"y":2}},
+                        {**payload,"selector":"button"}):
+            self.assertEqual((await self.client.post('/login/gesture',json=invalid,headers=self.headers)).status_code,400)
+        self.browser.human_login_gesture.assert_not_awaited()
+        for phase in ('down','move','up','cancel'):
+            response=await self.client.post('/login/gesture',json={**payload,"phase":phase},headers=self.headers)
+            self.assertEqual(response.status_code,200)
+            self.browser.human_login_gesture.assert_awaited_with(phase,payload['id'],payload['point'])
+        await self.client.post('/login/close',json={},headers=self.headers)
+        self.assertEqual((await self.client.post('/login/gesture',json=payload,headers=self.headers)).status_code,401)
 
     async def test_invalid_public_url_is_rejected(self):
         for url in ('http://public.example/login','https://user:pass@example.test/login',
@@ -233,7 +245,7 @@ class BrowserLoginTests(unittest.IsolatedAsyncioTestCase):
         page=SimpleNamespace(url='https://order.jd.com/list',screenshot=AsyncMock())
         c._active_page_unlocked=AsyncMock(return_value=page)
         for call in (lambda:c.submit_password('FAKE_USER','FAKE_PASSWORD'),c.human_login_view,
-                     lambda:c.human_login_pointer([{"x":0,"y":0,"t":0}]),lambda:c.human_login_code('123456')):
+                     lambda:c.human_login_gesture('down','fixture-gesture-id',{"x":0,"y":0}),lambda:c.human_login_code('123456')):
             with self.assertRaises(SafetyError):await call()
         page.screenshot.assert_not_awaited()
         page.url='https://passport.jd.com/new/login.aspx';c.login_until=time.monotonic()-1
@@ -267,3 +279,63 @@ class BrowserLoginTests(unittest.IsolatedAsyncioTestCase):
         page.url='https://order.jd.com/list'
         with self.assertRaises(SafetyError): await c.login_qr_png()
         image.screenshot.assert_not_awaited()
+
+
+class LiveGestureTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.controller=BrowserController(Settings.from_env())
+        self.page=SimpleNamespace(url='https://aq.jd.com/certified/index',viewport_size={'width':1000,'height':800},
+                                  mouse=SimpleNamespace(move=AsyncMock(),down=AsyncMock(),up=AsyncMock()),
+                                  screenshot=AsyncMock(return_value=b'fixture'),goto=AsyncMock())
+        self.controller._page=self.page
+        self.controller._active_page_unlocked=AsyncMock(return_value=self.page)
+        self.controller.login_until=time.monotonic()+60
+
+    async def asyncTearDown(self):
+        await self.controller.end_login()
+
+    async def test_drag_remains_pressed_during_live_view_and_releases_on_up(self):
+        c=self.controller
+        await c.human_login_gesture('down','fixture-gesture-id',{'x':0.1,'y':0.2})
+        await c.human_login_gesture('move','fixture-gesture-id',{'x':0.6,'y':0.2})
+        self.page.mouse.move.assert_awaited_with(600,160)
+        self.page.mouse.down.assert_awaited_once()
+        self.page.mouse.up.assert_not_awaited()
+        self.assertEqual(await c.human_login_view(),b'fixture')
+        c._context=SimpleNamespace(cookies=AsyncMock())
+        self.assertFalse(await c.checkpoint_login())
+        c._context.cookies.assert_not_awaited()
+        await c.human_login_gesture('up','fixture-gesture-id',{'x':0.7,'y':0.2})
+        self.page.mouse.up.assert_awaited_once()
+        self.assertIsNone(c._human_pointer_id)
+        self.assertIsNone(c._human_pointer_task)
+
+    async def test_stale_id_cannot_move_or_release_another_drag(self):
+        c=self.controller
+        await c.human_login_gesture('down','fixture-gesture-id',{'x':0.1,'y':0.2})
+        with self.assertRaises(SafetyError):
+            await c.human_login_gesture('move','other-gesture-id',{'x':0.9,'y':0.2})
+        await c.human_login_gesture('cancel','other-gesture-id',{'x':0.9,'y':0.2})
+        self.page.mouse.up.assert_not_awaited()
+        await c.human_login_gesture('cancel','fixture-gesture-id',{'x':0.1,'y':0.2})
+        self.page.mouse.up.assert_awaited_once()
+
+    async def test_navigation_away_releases_the_press_without_more_movement(self):
+        c=self.controller
+        await c.human_login_gesture('down','fixture-gesture-id',{'x':0.1,'y':0.2})
+        self.page.url='https://order.jd.com/list'
+        self.page.mouse.move.reset_mock()
+        with self.assertRaises(SafetyError):
+            await c.human_login_gesture('move','fixture-gesture-id',{'x':0.9,'y':0.2})
+        self.page.mouse.move.assert_not_awaited()
+        self.page.mouse.up.assert_awaited_once()
+
+    async def test_disconnect_timeout_releases_the_button(self):
+        c=self.controller
+        await c.human_login_gesture('down','fixture-gesture-id',{'x':0.1,'y':0.2})
+        with patch('jd_taobao_mcp.browser.asyncio.sleep',new=AsyncMock()) as sleep:
+            await c._expire_human_pointer('fixture-gesture-id')
+            sleep.assert_awaited_with(15)
+        self.page.mouse.up.assert_awaited_once()
+        with self.assertRaises(SafetyError):
+            await c.human_login_gesture('move','fixture-gesture-id',{'x':0.9,'y':0.2})

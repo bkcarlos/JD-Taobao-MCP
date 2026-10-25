@@ -111,6 +111,76 @@ class BrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(task,5)
             sock.close()
 
+    async def test_portal_drag_updates_before_release_and_supports_touch_cancel(self):
+        import socket
+        import uvicorn
+        from jd_taobao_mcp.login_portal import LoginPortal
+        remote_context=await self.browser.new_context(viewport={'width':1000,'height':600},service_workers='block')
+        remote=await remote_context.new_page()
+        fixture='''<style>body{margin:0;background:white}#knob{position:absolute;left:100px;top:200px;width:40px;height:40px;background:#112233}</style>
+          <form id="formlogin" onsubmit="return false"><input id="loginname"><input id="nloginpwd" type="password"><button id="loginsubmit" type="button">Login</button></form>
+          <div id="knob"></div><script>
+          window.dragging=false;window.dragX=120;window.releases=0;
+          document.getElementById('knob').onmousedown=()=>{window.dragging=true;};
+          document.onmousemove=e=>{if(window.dragging){window.dragX=e.clientX;document.getElementById('knob').style.left=(e.clientX-20)+'px';}};
+          document.onmouseup=()=>{if(window.dragging)window.releases++;window.dragging=false;};
+          </script>'''
+        await remote_context.route('**/*',lambda route:route.fulfill(content_type='text/html',body=fixture))
+        controller=BrowserController(replace(Settings.from_env(),action_delay_ms=0))
+        controller._context,controller._page=remote_context,remote
+        sock=socket.socket();sock.bind(('127.0.0.1',0))
+        portal=LoginPortal(controller,f'http://127.0.0.1:{sock.getsockname()[1]}/login')
+        server=uvicorn.Server(uvicorn.Config(portal,log_level='error',access_log=False,lifespan='off'))
+        task=asyncio.create_task(server.serve(sockets=[sock]))
+        async def front_until(predicate):
+            async with asyncio.timeout(8):
+                while not await self.page.evaluate(predicate):
+                    await asyncio.sleep(0.02)
+        try:
+            async def ready():
+                while not server.started: await asyncio.sleep(0.01)
+            await asyncio.wait_for(ready(),5)
+            await self.page.goto(portal.issue()['login_url'])
+            await self.page.get_by_role('button',name='账号密码登录',exact=True).click()
+            await self.page.get_by_label('账号',exact=True).fill('FAKE_USER')
+            await self.page.get_by_label('密码',exact=True).fill('FAKE_PASSWORD')
+            await self.page.get_by_role('button',name='登录',exact=True).click()
+            await front_until("document.getElementById('view').naturalWidth===1000")
+            await self.page.locator('#view').scroll_into_view_if_needed()
+            box=await self.page.locator('#view').bounding_box()
+            def position(x):return {'x':box['x']+x/1000*box['width'],'y':box['y']+220/600*box['height']}
+            await self.page.mouse.move(**position(120));await self.page.mouse.down()
+            await remote.wait_for_function('window.dragging===true')
+            await self.page.mouse.move(**position(300),steps=5)
+            await remote.wait_for_function('window.dragX>=295')
+            # The displayed remote frame must change while the button is still held.
+            await front_until('''() => {
+              const img=document.getElementById('view');if(!img.complete)return false;
+              const c=document.createElement('canvas');c.width=1000;c.height=600;
+              const ctx=c.getContext('2d');ctx.drawImage(img,0,0);
+              return ctx.getImageData(300,220,1,1).data[2]===51;
+            }''')
+            self.assertEqual(await remote.evaluate('window.releases'),0)
+            await self.page.mouse.move(**position(350));await self.page.mouse.up()
+            await remote.wait_for_function('window.releases===1&&!window.dragging')
+            await front_until('gesture===null')
+            cdp=await self.context.new_cdp_session(self.page)
+            await cdp.send('Emulation.setTouchEmulationEnabled',{'enabled':True,'maxTouchPoints':1})
+            await cdp.send('Input.dispatchTouchEvent',{'type':'touchStart','touchPoints':[position(350)]})
+            await remote.wait_for_function('window.dragging===true')
+            await cdp.send('Input.dispatchTouchEvent',{'type':'touchMove','touchPoints':[position(430)]})
+            await remote.wait_for_function('window.dragX>=425')
+            await cdp.send('Input.dispatchTouchEvent',{'type':'touchCancel','touchPoints':[]})
+            await remote.wait_for_function('window.releases===2&&!window.dragging')
+            await front_until('gesture===null')
+            self.assertIsNone(controller._human_pointer_id)
+        finally:
+            await controller.end_login()
+            server.should_exit=True
+            await asyncio.wait_for(task,5)
+            sock.close()
+            await remote_context.close()
+
     async def test_password_and_manual_controls_stay_on_fixed_login_document(self):
         await self.context.route("**/*", lambda route: route.fulfill(content_type="text/html", body="""
             <form id="formlogin" onsubmit="return false">
@@ -136,8 +206,9 @@ class BrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.page.locator('#authcode').input_value(),'123456')
         box=await self.page.locator('#loginsubmit').bounding_box()
         size=self.page.viewport_size
-        await controller.human_login_pointer([{'x':(box['x']+box['width']/2)/size['width'],
-                                               'y':(box['y']+box['height']/2)/size['height'],'t':0}])
+        point={'x':(box['x']+box['width']/2)/size['width'],'y':(box['y']+box['height']/2)/size['height']}
+        await controller.human_login_gesture('down','fixture-gesture-id',point)
+        await controller.human_login_gesture('up','fixture-gesture-id',point)
         self.assertEqual(await self.page.evaluate('window.submitted'),2)
         for verification_url in ("https://cfe.m.jd.com/privatedomain/risk_handler/03101900/?token=FAKE",
                                  "https://aq.jd.com/certified/index?ticket=FAKE"):
@@ -147,8 +218,9 @@ class BrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await controller.submit_password('FAKE_USER','FAKE_PASSWORD')
             self.assertEqual(await self.page.locator('#nloginpwd').input_value(),'')
             box=await self.page.locator('#loginsubmit').bounding_box()
-            await controller.human_login_pointer([{'x':(box['x']+box['width']/2)/size['width'],
-                                                   'y':(box['y']+box['height']/2)/size['height'],'t':0}])
+            point={'x':(box['x']+box['width']/2)/size['width'],'y':(box['y']+box['height']/2)/size['height']}
+            await controller.human_login_gesture('down','fixture-gesture-id',point)
+            await controller.human_login_gesture('up','fixture-gesture-id',point)
             self.assertEqual(await self.page.evaluate('window.submitted'),1)
         await controller.end_login()
         self.assertEqual(self.page.url,'about:blank')

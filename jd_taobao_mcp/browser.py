@@ -55,6 +55,8 @@ class BrowserController:
         self.login_navigation_blocked = False
         self._login_navigation_issue: dict[str, str] | None = None
         self._login_expiry_task: asyncio.Task | None = None
+        self._human_pointer_id: str | None = None
+        self._human_pointer_task: asyncio.Task | None = None
 
     @property
     def lock(self) -> asyncio.Lock:
@@ -267,6 +269,7 @@ class BrowserController:
     async def start_qr_login(self, deadline: float) -> None:
         """Open only the official JD login page for a short-lived human session."""
         async with self._lock:
+            await self._release_human_pointer_unlocked()
             self.login_until = deadline
             self.login_navigation_blocked = False
             self._login_navigation_issue = None
@@ -293,6 +296,7 @@ class BrowserController:
 
     async def _end_login_unlocked(self) -> None:
         """Discard transient password/verification fields without deleting cookies."""
+        await self._release_human_pointer_unlocked()
         self.login_until = 0.0
         if self._login_expiry_task and self._login_expiry_task is not asyncio.current_task():
             self._login_expiry_task.cancel()
@@ -335,25 +339,51 @@ class BrowserController:
                 raise SafetyError("登录页面已改变。")
             return data
 
-    async def human_login_pointer(self, points: list[dict[str, float]]) -> None:
-        """Replay only a person's bounded pointer gesture; do not infer or solve challenges."""
+    async def _release_human_pointer_unlocked(self) -> None:
+        """Release a held button on completion, disconnect timeout or session cleanup."""
+        active = self._human_pointer_id is not None
+        self._human_pointer_id = None
+        if self._human_pointer_task and self._human_pointer_task is not asyncio.current_task():
+            self._human_pointer_task.cancel()
+        self._human_pointer_task = None
+        if active and self._page is not None:
+            with suppress(PlaywrightError):
+                await self._page.mouse.up()
+
+    async def _expire_human_pointer(self, gesture_id: str) -> None:
+        """Bound a human drag even when its tab disconnects before mouse-up."""
+        await asyncio.sleep(15)
         async with self._lock:
-            page = await self._human_login_page_unlocked()
-            viewport = page.viewport_size
-            if not viewport:
-                raise SafetyError("登录窗口尺寸不可用。")
-            await page.mouse.move(points[0]["x"]*viewport["width"], points[0]["y"]*viewport["height"])
-            await page.mouse.down()
+            if self._human_pointer_id == gesture_id:
+                await self._release_human_pointer_unlocked()
+
+    async def human_login_gesture(self, phase: str, gesture_id: str, point: dict[str, float]) -> None:
+        """Forward one human pointer event, retaining the press between bounded requests."""
+        async with self._lock:
+            if phase == "cancel":
+                if self._human_pointer_id == gesture_id:
+                    await self._release_human_pointer_unlocked()
+                return
+            if phase == "down":
+                if self._human_pointer_id is not None:
+                    raise SafetyError("请先结束当前拖动。")
+            elif self._human_pointer_id != gesture_id:
+                raise SafetyError("拖动已结束或超时，请重新操作。")
             try:
-                previous = points[0]["t"]
-                for point in points[1:]:
-                    if self.login_until <= time.monotonic() or not self._is_human_login_document(page.url):
-                        raise SafetyError("登录页面已改变或过期。")
-                    await asyncio.sleep(min(0.1, max(0, (point["t"]-previous)/1000)))
-                    await page.mouse.move(point["x"]*viewport["width"], point["y"]*viewport["height"])
-                    previous = point["t"]
-            finally:
-                await page.mouse.up()
+                page = await self._human_login_page_unlocked()
+                viewport = page.viewport_size
+                if not viewport:
+                    raise SafetyError("登录窗口尺寸不可用。")
+                await page.mouse.move(point["x"]*viewport["width"], point["y"]*viewport["height"])
+                if phase == "down":
+                    self._human_pointer_id = gesture_id
+                    self._human_pointer_task = asyncio.create_task(self._expire_human_pointer(gesture_id))
+                    await page.mouse.down()
+                elif phase == "up":
+                    await self._release_human_pointer_unlocked()
+            except (SafetyError, PlaywrightError):
+                await self._release_human_pointer_unlocked()
+                raise
 
     async def human_login_code(self, code: str) -> None:
         """Fill only a focused non-password verification input selected by the human."""
@@ -401,6 +431,8 @@ class BrowserController:
         """Save detected credentials atomically before reporting a completed scan."""
         async with self._lock:
             if self._context is None:
+                return False
+            if self._human_pointer_id is not None:
                 return False
             if self._page is not None and (is_jd_login_callback(self._page.url)
                                            or is_jd_verification_page(self._page.url)):
