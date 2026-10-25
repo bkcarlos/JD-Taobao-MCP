@@ -297,12 +297,11 @@ async def extract_product_detail(page: Page, platform: str) -> dict[str, Any]:
 def _selectors(platform: str) -> dict[str, list[str]]:
     if platform == "jd":
         return {
-            "title": [".sku-name", "#name h1", "h1", "meta[property='og:title']"],
+            "title": [".top-name", ".sku-name", "#name h1", "meta[property='og:title']"],
             "price": [
+                ".product-price-panel .product-price--main",
                 ".p-price .price",
                 ".summary-price .price",
-                "[class*='price'] [class*='price']",
-                "[class*='price']",
             ],
             "shop": [".name a", ".shop-name", "[class*='shopName']", "[class*='shop-name']"],
             "reviews": [".comment-count .count", "#comment-count", "[class*='comment']"],

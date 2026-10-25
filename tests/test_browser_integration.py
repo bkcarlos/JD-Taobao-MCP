@@ -15,6 +15,8 @@ from playwright.async_api import Error, async_playwright
 
 from jd_taobao_mcp.browser import BrowserController, _LINKS_SCRIPT
 from jd_taobao_mcp.config import Settings
+from jd_taobao_mcp.extractors.detail import extract_product_detail
+from jd_taobao_mcp.extractors.search import extract_jd_search
 
 
 @unittest.skipUnless(os.getenv("MCP_BROWSER_TESTS") == "1", "opt-in Chromium tests")
@@ -31,6 +33,52 @@ class BrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.browser.close()
         await self.pw.stop()
+
+    async def test_jd_detail_selects_product_not_recommendation_or_calculator(self):
+        """Read modern and legacy product prices without unrelated page widgets."""
+        await self.context.route("**/*", lambda route: route.fulfill(body="<html></html>", content_type="text/html"))
+        await self.page.goto("https://item.jd.com/123.html")
+        unrelated = '''<h1>Example calculator</h1>
+            <span class="cross_platform_card_price">¥999.00</span>
+            <span class="service-price">19.00</span>'''
+        for markup, expected in [
+            ('<div class="top-name">Example mouse</div><div class="product-price-panel"><span class="product-price--main"><span>¥</span><span>123.45</span></span></div>', 123.45),
+            ('<div class="sku-name">Example mouse</div><div class="summary-price"><span class="price">¥89.00</span></div>', 89.0),
+            ('<meta property="og:title" content="Example mouse">', None),
+        ]:
+            with self.subTest(expected=expected):
+                await self.page.set_content(unrelated + markup)
+                result = await extract_product_detail(self.page, "jd")
+                self.assertEqual(result["title"], "Example mouse")
+                self.assertEqual(result["price"], expected)
+
+    async def test_jd_search_decodes_metadata_and_keeps_prices_in_each_card(self):
+        """Modern search cards expose only their own price and decoded metadata."""
+        from urllib.parse import urlencode, quote
+        await self.context.route("**/*", lambda route: route.fulfill(body="<html></html>", content_type="text/html"))
+        await self.page.goto("https://search.jd.com/Search")
+        def card(pid, price):
+            metadata = urlencode({"pid": pid, "wname": quote("示例鼠标"), "seller": quote("示例店铺"), "commentNum": "5000"})
+            return f'''<div class="plugin_goodsCardWrapper"><div class="_card_fixture_1">
+                <a href="https://chat.jd.com/?{metadata}">Contact</a>
+                {price}<div class="comments">5000</div>
+                </div></div>'''
+        await self.page.set_content('<div class="_price_unrelated_1">¥999</div>' +
+                                    card("123", '<span class="_price_fixture_31"><i>¥</i>123<span>.45</span></span>') +
+                                    card("456", ''))
+        items = await extract_jd_search(self.page, 2)
+        self.assertEqual([item["price"] for item in items], [123.45, None])
+        self.assertEqual(items[0]["title"], "示例鼠标")
+        self.assertEqual(items[0]["shop"], "示例店铺")
+        self.assertEqual(items[0]["url"], "https://item.jd.com/123.html")
+
+    async def test_jd_fallback_does_not_treat_model_number_as_price(self):
+        """An unrecognized card without a currency amount has no known price."""
+        await self.context.route("**/*", lambda route: route.fulfill(body="<html></html>", content_type="text/html"))
+        await self.page.goto("https://search.jd.com/Search")
+        await self.page.set_content('<article><a href="https://item.jd.com/123.html">Mouse model 123</a> 5000 reviews</article>')
+        items = await extract_jd_search(self.page, 1)
+        self.assertIsNone(items[0]["price"])
 
     async def test_real_dom_never_exports_input_or_anchor_text(self):
         await self.context.route("**/*", lambda route: route.abort())

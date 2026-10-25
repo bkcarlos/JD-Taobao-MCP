@@ -54,21 +54,28 @@ async def extract_jd_search(page: Page, max_results: int) -> list[dict[str, Any]
           });
           const out = [];
           const seen = new Set();
+          // Chat-link metadata is encoded once more than URLSearchParams decodes.
+          const decode = (value) => {
+            try { return decodeURIComponent(value || ''); } catch (_) { return value || ''; }
+          };
           for (const link of document.querySelectorAll('a[href*="chat.jd.com"][href*="pid="]')) {
             try {
               const url = new URL(link.href);
               const pid = url.searchParams.get('pid');
-              if (!pid || seen.has(pid)) continue;
-              const title = clean(url.searchParams.get('wname') || link.getAttribute('title') || link.innerText, 300);
+              if (url.hostname !== 'chat.jd.com' || !/^[0-9]+$/.test(pid || '') || seen.has(pid)) continue;
+              const card = link.closest('.plugin_goodsCardWrapper');
+              const price = card?.querySelector('[class^="_price_"], [class*=" _price_"]');
+              const image = card?.querySelector('img');
+              const title = clean(decode(url.searchParams.get('wname')) || link.getAttribute('title') || link.innerText, 300);
               if (!title) continue;
               seen.add(pid);
               out.push({
                 title,
-                price_text: '',
-                shop: clean(url.searchParams.get('seller'), 120),
+                price_text: price?.textContent || '',
+                shop: clean(decode(url.searchParams.get('seller')), 120),
                 comment_text: clean(url.searchParams.get('commentNum'), 80),
                 url: `https://item.jd.com/${pid}.html`,
-                image: url.searchParams.get('imgUrl') || ''
+                image: image?.getAttribute('data-lazy-img') || image?.getAttribute('data-src') || image?.src || decode(url.searchParams.get('imgUrl'))
               });
               if (out.length >= limit) break;
             } catch (_) {}
@@ -207,7 +214,7 @@ async def _fallback_product_links(
         {
             "platform": platform,
             "title": compact_text(item.get("title"), 300),
-            "price": parse_price(item.get("card_text")),
+            "price": parse_price(_first_price_text(item.get("card_text", ""))),
             "price_text": "",
             "shop": "",
             "comment_text": "",
