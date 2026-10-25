@@ -22,3 +22,6 @@ artifacts/*
 # Logs and packaged archives
 *.log
 *.zip
+# Private login snapshots, regardless of profile directory override
+login-cookies.json
+.cookies-*

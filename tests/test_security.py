@@ -117,7 +117,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         ]))
         self.assertFalse((await c.check_login("jd"))["likely_logged_in"])
         c._context.cookies.return_value.append(
-            {"name": "pt_key", "value": "FAKE_SECRET", "domain": ".jd.com"})
+            {"name": "thor", "value": "FAKE_SECRET", "domain": ".jd.com"})
         result = await c.check_login("jd")
         self.assertTrue(result["likely_logged_in"])
         self.assertNotIn("FAKE_SECRET", json.dumps(result))

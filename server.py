@@ -23,9 +23,12 @@ from jd_taobao_mcp.config import Settings
 from jd_taobao_mcp.service import ShoppingBrowserService
 from jd_taobao_mcp.http_auth import BearerAuth, http_transport_security
 from jd_taobao_mcp.safety import ensure_readable_url
+from jd_taobao_mcp.login_portal import LoginPortal, WithLoginPortal
 
 settings = Settings.from_env()
 service = ShoppingBrowserService(settings)
+login_public_url = os.getenv("LOGIN_PUBLIC_URL", "").strip()
+login_portal = LoginPortal(service.jd_browser, login_public_url) if login_public_url else None
 
 mcp = FastMCP(
     "JD-Taobao-Browser",
@@ -57,6 +60,16 @@ async def browser_status() -> dict[str, Any]:
         "jd": await service.jd_browser.status(),
         "taobao": await service.taobao_browser.status(),
     }
+
+
+@mcp.tool()
+async def begin_login(platform: str = "jd") -> dict[str, Any]:
+    """生成供用户本人打开的短时扫码链接，不返回二维码或 Cookie。仅支持京东。"""
+    if platform != "jd":
+        raise ValueError("私有扫码入口目前仅支持京东。")
+    if login_portal is None or "--http" not in sys.argv:
+        return {"success": False, "message": "管理员需启用 HTTP 模式并配置 LOGIN_PUBLIC_URL 私有扫码入口。"}
+    return login_portal.issue()
 
 
 @mcp.tool()
@@ -173,6 +186,8 @@ async def browser_close() -> dict[str, Any]:
 def main() -> None:
     if "--http" in sys.argv:
         app = BearerAuth(mcp.streamable_http_app(), os.environ.get("MCP_HTTP_TOKEN", ""))
+        if login_portal is not None:
+            app = WithLoginPortal(app, login_portal)
         port = int(os.environ.get("MCP_HTTP_PORT", "8000"))
         if not 1 <= port <= 65535:
             raise ValueError("MCP_HTTP_PORT must be between 1 and 65535.")

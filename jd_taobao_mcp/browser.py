@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from contextlib import suppress
 from html import escape
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from playwright.async_api import (
     BrowserContext, Page, Playwright, Route, WebSocketRoute,
@@ -12,6 +14,7 @@ from playwright.async_api import (
 )
 
 from .config import Settings
+from .login_state import load_cookies, save_cookies, likely_logged_in
 from .safety import (
     SafetyError, display_url, ensure_allowed_url, ensure_readable_url,
     is_allowed_request, is_readable_url, public_url,
@@ -48,6 +51,7 @@ class BrowserController:
         self._context: BrowserContext | None = None
         self._page: Page | None = None
         self._lock = asyncio.Lock()
+        self.login_until = 0.0
 
     @property
     def lock(self) -> asyncio.Lock:
@@ -95,9 +99,11 @@ class BrowserController:
                     return
                 await route.fulfill(response=response)
             finally:
-                await response.dispose()
+                with suppress(PlaywrightError):
+                    await response.dispose()
         except PlaywrightError:
-            await route.abort("failed")
+            with suppress(PlaywrightError):
+                await route.abort("failed")
 
     async def _block_websocket(self, route: WebSocketRoute) -> None:
         """No tools require a websocket connection or arbitrary outbound tunnel."""
@@ -130,6 +136,13 @@ class BrowserController:
             self._context = await self._playwright.chromium.launch_persistent_context(
                 str(self.settings.profile_dir), **options
             )
+            cookies = load_cookies(self.settings.profile_dir)
+            if cookies:
+                # Never overwrite newer cookies already persisted by Chromium.
+                existing = {(c["name"], c["domain"], c["path"]) for c in await self._context.cookies()}
+                missing = [c for c in cookies if (c["name"], c["domain"], c["path"]) not in existing]
+                if missing:
+                    await self._context.add_cookies(missing)
             await self._context.route("**/*", self._guard_request)
             await self._context.route_web_socket("**/*", self._block_websocket)
             self._context.set_default_navigation_timeout(self.settings.navigation_timeout_ms)
@@ -153,7 +166,13 @@ class BrowserController:
             self._page = await self._context.new_page()
         return self._page
 
+    def ensure_not_logging_in(self) -> None:
+        """Prevent MCP navigation from disturbing the human login session."""
+        if self.login_until > time.monotonic():
+            raise SafetyError("正在等待人工扫码，请完成或关闭登录页后再查询商品。")
+
     async def _readable_page_unlocked(self) -> Page:
+        self.ensure_not_logging_in()
         page = await self._active_page_unlocked()
         ensure_readable_url(page.url)
         return page
@@ -184,6 +203,7 @@ class BrowserController:
     async def navigate(self, url: str) -> dict[str, Any]:
         ensure_allowed_url(url)
         async with self._lock:
+            self.ensure_not_logging_in()
             return await self._navigate_unlocked(await self._active_page_unlocked(), url)
 
     async def open_login(self, platform: str) -> dict[str, Any]:
@@ -196,22 +216,55 @@ class BrowserController:
         return result
 
     async def check_login(self, platform: str) -> dict[str, Any]:
-        domains = {"jd": "jd.com", "taobao": "taobao.com"}
-        names = {"jd": {"pt_key", "pin", "thor"}, "taobao": {"tracknick", "lgc", "_tb_token_"}}
-        if platform not in domains:
-            raise ValueError("platform 仅支持 jd 或 taobao")
+        """Return a credential-presence hint without exposing account data."""
         async with self._lock:
             await self._active_page_unlocked()
             assert self._context is not None
+            present = likely_logged_in(await self._context.cookies(), platform)
+            return {"platform": platform, "likely_logged_in": present,
+                    "message": "仅检测未过期登录凭据；服务端是否仍接受登录以实际查询为准。"}
+
+    async def start_qr_login(self, deadline: float) -> None:
+        """Open only the official JD login page for a short-lived human session."""
+        async with self._lock:
+            self.login_until = deadline
+            await self._navigate_unlocked(await self._active_page_unlocked(), "https://passport.jd.com/new/login.aspx")
+
+    async def login_qr_png(self) -> bytes:
+        """Render only JD's QR image to the authenticated human portal, never MCP."""
+        async with self._lock:
+            page = await self._active_page_unlocked()
+            if self.login_until <= time.monotonic() or not self._is_jd_login_page(page.url):
+                raise SafetyError("扫码页面已关闭或过期。")
+            image = page.locator("#passport-main-qrcode-img")
+            source = urljoin(page.url, await image.get_attribute("src", timeout=3000) or "")
+            parsed = urlparse(source)
+            if (parsed.scheme != "https" or parsed.hostname != "qr.m.jd.com" or parsed.path != "/show"
+                    or parsed.username is not None or parsed.password is not None or parsed.port not in (None, 443)):
+                raise SafetyError("二维码尚未就绪；如需验证码，请在官方页面人工处理。")
+            data = await image.screenshot(type="png", timeout=5000)
+            if not self._is_jd_login_page(page.url):
+                raise SafetyError("登录页面已改变。")
+            return data
+
+    @staticmethod
+    def _is_jd_login_page(url: str) -> bool:
+        """Match a fixed login document, not arbitrary pages on the account host."""
+        parsed = urlparse(url)
+        return (parsed.scheme == "https" and parsed.netloc == "passport.jd.com"
+                and parsed.path == "/new/login.aspx")
+
+    async def checkpoint_login(self) -> bool:
+        """Save detected credentials atomically before reporting a completed scan."""
+        async with self._lock:
+            if self._context is None:
+                return False
             cookies = await self._context.cookies()
-            root = domains[platform]
-            present = {
-                c["name"] for c in cookies
-                if c.get("domain", "").lstrip(".") == root
-                or c.get("domain", "").lstrip(".").endswith("." + root)
-            }
-            return {"platform": platform, "likely_logged_in": bool(present & names[platform]),
-                    "message": "仅检测登录 Cookie 是否存在；以实际商品查询结果为准。"}
+            if not likely_logged_in(cookies, "jd"):
+                return False
+            save_cookies(self.settings.profile_dir, cookies)
+            self.login_until = 0.0
+            return True
 
     async def _links_unlocked(self, page: Page, limit: int) -> list[dict[str, str]]:
         links = await page.evaluate(_LINKS_SCRIPT, limit)
@@ -262,7 +315,9 @@ class BrowserController:
 
     async def close(self) -> dict[str, Any]:
         async with self._lock:
+            self.ensure_not_logging_in()
             if self._context is not None:
+                save_cookies(self.settings.profile_dir, await self._context.cookies())
                 await self._context.close()
             if self._playwright is not None:
                 await self._playwright.stop()

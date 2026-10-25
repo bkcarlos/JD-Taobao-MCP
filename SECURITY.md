@@ -41,3 +41,27 @@ All authenticated clients share the same browser session. This is not a multi-us
 ## Verification
 
 Run `python -m unittest discover -s tests -v`. Set `MCP_BROWSER_TESTS=1` after installing Playwright Chromium to include browser regressions. Tests use fake credentials, synthetic pages and loopback HTTP servers; no account login or real shopping traffic is needed. The suite checks sensitive-page rejection, output minimization, redirect-chain blocking, disabled mutation tools and HTTP authorization. It does not audit third-party dependency source code or prove compatibility with live shopping sites.
+
+
+## Optional human QR login
+
+`LOGIN_PUBLIC_URL` enables a separate `/login` portal. Keep it on a private network or an
+SSH loopback tunnel, with HTTPS for non-loopback origins. Proxy only the login routes;
+MCP routes still require the existing bearer token. Portal Host values must exactly match
+the configured URL, and POST requests require the exact Origin and a custom action header.
+
+`begin_login` returns a single-use, 10-minute capability in a URL fragment. Treat that link
+as sensitive: it grants access to the QR login attempt, not arbitrary browser control or
+MCP tools. The human browser removes the fragment and exchanges it for a short-lived
+HttpOnly, SameSite=Strict cookie (Secure with HTTPS). The portal has no external scripts,
+frames or analytics and uses no-store responses and a restrictive CSP. It renders only the
+fixed QR image from the official JD login page; it cannot screenshot arbitrary pages,
+submit passwords or solve verification challenges. Existing MFA and CAPTCHA requirements
+remain in force. An authenticated human must explicitly start QR loading.
+
+Cookie snapshots remain inside the private persistent profile (0700 directory, atomic
+0600 file). They are not returned to MCP or the portal and are ignored by Git. Only
+unexpired first-party cookies are restored, without overwriting newer Chromium state.
+A cookie-presence hint is not proof of a valid server-side session. Profile and volume
+backups contain credentials and must be protected like account access. A hard crash can
+lose changes since the last login checkpoint or clean close.

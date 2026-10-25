@@ -164,6 +164,7 @@ codex mcp list
 |---|---|
 | `browser_start` | 启动可见 Chromium 浏览器 |
 | `browser_status` | 查看京东、淘宝浏览器状态 |
+| `begin_login` | 生成京东短时私有扫码链接（需配置 `LOGIN_PUBLIC_URL`） |
 | `open_login` | 打开京东或淘宝登录页 |
 | `check_login` | 检查是否可能已登录，不返回 Cookie 值 |
 | `open_url` | 打开白名单内的公开商品、搜索或首页；登录使用 `open_login` |
@@ -279,3 +280,24 @@ CI 会运行这两类测试；本地也可用 `MCP_BROWSER_TEST_EXECUTABLE` 指�
 ## License
 
 MIT
+
+
+### Docker 中扫码登录
+
+配置 `LOGIN_PUBLIC_URL` 为用户可以打开的私有入口，例如
+`https://shopping.example.test/login`。反向代理须保留 `/login` 路径与原始 Host，
+仅转发 `/login` 及其子路径。不要暴露整个 MCP 服务，也不要在链接中放入 MCP 令牌。
+也可使用 `http://127.0.0.1:18123/login` 配合 SSH 本地转发；HTTP 入口仅允许回环地址。
+
+在 MCP 客户端给 bot 开放 `begin_login` 工具。用户要求登录时，bot 调用
+`begin_login(platform="jd")` 并返回 `login_url`。用户本人打开链接，点击“显示二维码”，
+用京东 App 扫码并在手机上确认。入口链接一次性使用，整个会话最多 10 分钟；
+刷新已打开的页面会复用 HttpOnly 会话 Cookie。二维码不作为 MCP 工具结果返回。
+目前私有扫码入口仅支持京东，不提供密码输入或自动处理验证码；遇到额外验证会提示人工处理。
+
+检测到登录凭据后，页面先将 Cookie 原子保存到浏览器私有目录，再提示保存完成。
+资料目录权限为 0700，`login-cookies.json` 权限为 0600，保存在现有 Docker 数据卷中。
+服务重启会恢复尚未过期且浏览器中不存在的 Cookie（包括会话 Cookie）；正常关闭也会更新快照。
+网站仍可撤销登录或要求重新验证，`check_login` 仅表示凭据存在，不保证服务端仍接受。
+登录期间同一浏览器的商品导航暂时拒绝；完成、关闭入口或会话超时后恢复。
+关闭入口不会清除登录。不要删除数据卷，不要将资料目录或 Cookie 快照提交到仓库。
