@@ -270,6 +270,20 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
                 await server.open_url("https://passport.jd.com/logout")
             select_browser.assert_not_called()
 
+    def test_container_binding_requires_token_and_retains_host_validation(self):
+        import server
+        env = {"MCP_HTTP_HOST": "0.0.0.0", "MCP_HTTP_PORT": "8000", "MCP_HTTP_TOKEN": "test-only-" + "x" * 40}
+        with patch.dict("os.environ", env), patch("sys.argv", ["server.py", "--http"]):
+            with patch.object(server.uvicorn, "run") as run:
+                server.main()
+                self.assertEqual(run.call_args.kwargs["host"], "0.0.0.0")
+                self.assertIsInstance(run.call_args.args[0], BearerAuth)
+                self.assertTrue(server.mcp.settings.transport_security.enable_dns_rebinding_protection)
+            with patch.dict("os.environ", {"MCP_HTTP_TOKEN": ""}), self.assertRaises(ValueError):
+                server.main()
+            with patch.dict("os.environ", {"MCP_HTTP_HOST": "untrusted.example"}), self.assertRaises(ValueError):
+                server.main()
+
 
 if __name__ == "__main__":
     unittest.main()

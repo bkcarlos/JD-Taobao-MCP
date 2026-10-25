@@ -194,6 +194,7 @@ codex mcp list
 | `SLOW_MO_MS` | `80` | Playwright 慢动作延迟 |
 | `MAX_SEARCH_RESULTS` | `30` | 单次搜索最多返回数量 |
 | `MCP_HTTP_TOKEN` | 空 | HTTP 模式必填，至少 32 个可见 ASCII 字符的独立随机令牌 |
+| `MCP_HTTP_HOST` | `127.0.0.1` | HTTP 监听地址；Docker 内使用 `0.0.0.0`，宿主机映射仍为回环地址 |
 | `MCP_HTTP_PORT` | `8000` | HTTP 监听端口，仅绑定 `127.0.0.1` |
 | `PROXY` | 空 | 可选代理，例如 `http://127.0.0.1:7897` |
 
@@ -209,6 +210,26 @@ $env:MCP_HTTP_TOKEN = (.\.venv\Scripts\python.exe -c "import secrets; print(secr
 客户端连接 `http://127.0.0.1:8000/mcp`，在每个请求中发送 `Authorization: Bearer <MCP_HTTP_TOKEN>`。令牌只能保存在客户端的私有配置中，不要放入 URL 或提交到 Git。缺少令牌时服务拒绝启动；请求缺少或使用错误令牌时返回 401。所有持有令牌的客户端共享同一浏览器会话，不支持多用户隔离。
 
 跨机器访问需要自行配置可信的 TLS 反向代理或加密隧道，保留认证头，避免明文传输令牌。优先在同一台机器上使用 stdio。
+
+## Docker 部署
+
+```sh
+cp .env.example .env
+# 在私有 .env 中设置独立的随机 MCP_HTTP_TOKEN，然后启动：
+docker compose up -d --build
+```
+
+宿主机通过 `http://127.0.0.1:18123/mcp` 访问，发送 `Authorization: Bearer <MCP_HTTP_TOKEN>`。端口不发布到公网。使用 `MCP_HOST_PORT` 调整宿主机端口，使用 `MCP_ENV_FILE` 指定已有私有环境文件；容器内部始终监听 8000。
+
+容器以非 root 用户运行，启用 Chromium 沙箱，根文件系统只读，浏览器资料保存在 `browser-data` 命名卷。`docker compose down` 保留登录资料；`down -v` 会删除资料。不要在两个实例间同时挂载并使用同一浏览器资料。
+
+```sh
+docker compose ps
+docker compose logs --tail=100
+docker compose run --rm --no-deps -e MCP_BROWSER_TESTS=1 mcp python -m unittest discover -s tests -v
+```
+
+健康检查验证未授权请求返回 401；首次部署还需通过带认证的 MCP 客户端调用 `browser_start` 验证沙箱。服务器默认无头模式，登录需要另行安排人工浏览器会话。Docker 权限与 seccomp 配置见 [docker/README.md](docker/README.md)。
 
 ## 安全边界与兼容性变化（0.1.1）
 

@@ -1,0 +1,12 @@
+**
+!Dockerfile
+!pyproject.toml
+!README.md
+!LICENSE
+!server.py
+!jd_taobao_mcp/
+!jd_taobao_mcp/extractors/
+!jd_taobao_mcp/**/*.py
+!jd_taobao_mcp/*.py
+!tests/
+!tests/*.py

@@ -1,0 +1,47 @@
+services:
+  mcp:
+    build: .
+    image: jd-taobao-mcp:local
+    init: true
+    restart: unless-stopped
+    env_file:
+      - ${MCP_ENV_FILE:-.env}
+    environment:
+      MCP_HTTP_HOST: 0.0.0.0
+      MCP_HTTP_PORT: "8000"
+      PLAYWRIGHT_HEADLESS: "true"
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+      BROWSER_PROFILE_DIR: /data/browser-profile
+    ports:
+      - "127.0.0.1:${MCP_HOST_PORT:-18123}:8000"
+    volumes:
+      - browser-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,noexec,size=256m,mode=1777
+    shm_size: 512m
+    mem_limit: 1536m
+    pids_limit: 512
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./docker/seccomp.json
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import http.client,sys; c=http.client.HTTPConnection('127.0.0.1',8000,timeout=5); c.request('GET','/mcp'); sys.exit(c.getresponse().status != 401)"
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  browser-data:

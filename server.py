@@ -175,7 +175,10 @@ def main() -> None:
         port = int(os.environ.get("MCP_HTTP_PORT", "8000"))
         if not 1 <= port <= 65535:
             raise ValueError("MCP_HTTP_PORT must be between 1 and 65535.")
-        uvicorn.run(app, host="127.0.0.1", port=port, access_log=False)
+        host = os.environ.get("MCP_HTTP_HOST", "127.0.0.1")
+        if host not in {"127.0.0.1", "::1", "0.0.0.0", "::"}:
+            raise ValueError("MCP_HTTP_HOST must be a loopback or wildcard IP address.")
+        uvicorn.run(app, host=host, port=port, access_log=False)
     else:
         mcp.run(transport="stdio")
 
