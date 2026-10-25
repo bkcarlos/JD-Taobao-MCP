@@ -5,10 +5,12 @@ from typing import Any
 
 from playwright.async_api import Page
 
+from ..safety import ensure_readable_url, image_link, product_link
 from .helpers import compact_text, dedupe_dicts, normalize_url, parse_price
 
 
 async def extract_jd_search(page: Page, max_results: int) -> list[dict[str, Any]]:
+    ensure_readable_url(page.url)
     raw = await page.evaluate(
         """
         (limit) => {
@@ -76,10 +78,11 @@ async def extract_jd_search(page: Page, max_results: int) -> list[dict[str, Any]
         """,
         max_results,
     )
+    ensure_readable_url(page.url)
     items: list[dict[str, Any]] = []
     for item in raw:
         title = compact_text(item.get("title"), 300)
-        url = normalize_url(page.url, item.get("url"))
+        url = product_link(normalize_url(page.url, item.get("url")))
         if not title or not url:
             continue
         items.append(
@@ -92,7 +95,7 @@ async def extract_jd_search(page: Page, max_results: int) -> list[dict[str, Any]
                 "comment_text": compact_text(item.get("comment_text"), 80),
                 "url": url,
                 "product_url": url,
-                "image": normalize_url(page.url, item.get("image")),
+                "image": image_link(normalize_url(page.url, item.get("image"))),
             }
         )
     if items:
@@ -101,6 +104,7 @@ async def extract_jd_search(page: Page, max_results: int) -> list[dict[str, Any]
 
 
 async def extract_taobao_search(page: Page, max_results: int) -> list[dict[str, Any]]:
+    ensure_readable_url(page.url)
     raw = await page.evaluate(
         r"""
         (limit) => {
@@ -128,13 +132,14 @@ async def extract_taobao_search(page: Page, max_results: int) -> list[dict[str, 
         """,
         max_results * 3,
     )
+    ensure_readable_url(page.url)
     items: list[dict[str, Any]] = []
     for item in raw:
         card_text = compact_text(item.get("card_text"), 600)
         title = compact_text(item.get("title"), 300)
         if not title or len(title) < 2:
             title = compact_text(card_text.split(" ¥")[0], 300)
-        url = normalize_url(page.url, item.get("url"))
+        url = product_link(normalize_url(page.url, item.get("url")))
         if not title or not url:
             continue
         price_text = _first_price_text(card_text)
@@ -145,25 +150,16 @@ async def extract_taobao_search(page: Page, max_results: int) -> list[dict[str, 
                 "price": parse_price(price_text or card_text),
                 "price_text": price_text,
                 "shop": "",
-            "comment_text": "",
-            "url": url,
-            "product_url": url,
-            "image": normalize_url(page.url, item.get("image")),
-            "card_text": card_text,
-        }
+                "comment_text": "",
+                "url": url,
+                "product_url": url,
+                "image": image_link(normalize_url(page.url, item.get("image"))),
+            }
         )
     if items:
         return dedupe_dicts(items, "url")[:max_results]
     return await _fallback_product_links(page, "taobao", max_results)
 
-
-def _first_price_text(text: str) -> str:
-    if not text:
-        return ""
-    for token in text.split(" "):
-        if "¥" in token or "￥" in token:
-            return token[:80]
-    return ""
 
 def _first_price_text(text: str) -> str:
     if not text:
@@ -185,6 +181,7 @@ async def _fallback_product_links(
         if platform == "jd"
         else "item.taobao.com|detail.tmall.com|new.m.taobao.com/detail.htm|item.m.taobao.com/item.htm"
     )
+    ensure_readable_url(page.url)
     raw = await page.evaluate(
         """
         ({pattern, limit}) => {
@@ -205,6 +202,7 @@ async def _fallback_product_links(
         """,
         {"pattern": pattern, "limit": max_results},
     )
+    ensure_readable_url(page.url)
     return [
         {
             "platform": platform,
@@ -213,11 +211,10 @@ async def _fallback_product_links(
             "price_text": "",
             "shop": "",
             "comment_text": "",
-            "url": normalize_url(page.url, item.get("url")),
-            "product_url": normalize_url(page.url, item.get("url")),
+            "url": url,
+            "product_url": url,
             "image": None,
-            "card_text": compact_text(item.get("card_text"), 600),
         }
         for item in raw
-        if item.get("url") and item.get("title")
+        if item.get("title") and (url := product_link(normalize_url(page.url, item.get("url"))))
     ]

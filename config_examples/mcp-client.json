@@ -7,10 +7,8 @@
       ],
       "env": {
         "PLAYWRIGHT_HEADLESS": "false",
-        "ALLOW_STATE_CHANGING_ACTIONS": "false",
         "PLAYWRIGHT_BROWSERS_PATH": ".ms-playwright",
         "BROWSER_PROFILE_DIR": ".tmp/browser-profile",
-        "ARTIFACTS_DIR": "artifacts",
         "TAOBAO_SEARCH_MODE": "mobile"
       }
     }

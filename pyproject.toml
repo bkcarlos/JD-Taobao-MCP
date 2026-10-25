@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jd-taobao-browser-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "A human-in-the-loop MCP server for browsing JD.com and Taobao/Tmall with Playwright."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -13,6 +13,7 @@ dependencies = [
   "mcp[cli]>=1.27,<2",
   "playwright>=1.54,<2",
   "python-dotenv>=1.0,<2",
+  "uvicorn>=0.31,<1",
 ]
 
 
@@ -21,5 +22,7 @@ jd-taobao-browser-mcp = "server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["jd_taobao_mcp"]
-include = ["server.py"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"server.py" = "server.py"
 

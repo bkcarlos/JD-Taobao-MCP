@@ -8,7 +8,7 @@ from urllib.parse import quote, quote_plus, urlparse
 from .browser import BrowserController
 from .config import Settings
 from .extractors import extract_jd_search, extract_product_detail, extract_taobao_search
-from .safety import page_requires_user_verification
+from .safety import ensure_product_url, page_requires_user_verification, public_url
 
 
 class ShoppingBrowserService:
@@ -67,7 +67,7 @@ class ShoppingBrowserService:
                     "platform": platform,
                     "keyword": keyword,
                     "requires_user_verification": True,
-                    "url": page.url,
+                    "url": public_url(page.url),
                     "message": "Page requires manual verification in the visible browser.",
                     "items": [],
                     "detail_output_contract": _detail_output_contract(),
@@ -111,6 +111,7 @@ class ShoppingBrowserService:
         }
 
     async def get_product_detail(self, url: str) -> dict[str, Any]:
+        ensure_product_url(url)
         platform = platform_from_url(url)
         browser = self._browser_for_platform(platform)
         nav = await browser.navigate(url)
@@ -124,12 +125,12 @@ class ShoppingBrowserService:
                 return {
                     "success": False,
                     "platform": platform,
-                    "url": page.url,
-                    "product_url": page.url,
+                    "url": public_url(page.url),
+                    "product_url": public_url(page.url),
                     "requires_user_verification": True,
                     "message": "Product page requires manual verification in the visible browser.",
                     **_empty_detail_contract_fields(
-                        "requires_user_verification", product_url=page.url
+                        "requires_user_verification", product_url=public_url(page.url)
                     ),
                 }
             await self._prepare_product_detail_page(page, platform)
@@ -173,9 +174,9 @@ class ShoppingBrowserService:
                 continue
             try:
                 detail = await self.get_product_detail(url)
-            except Exception as exc:
+            except Exception:
                 item["detail_success"] = False
-                item["detail_error"] = str(exc)
+                item["detail_error"] = "Detail extraction failed or was blocked by the access policy."
                 item.update(
                     _empty_detail_contract_fields(
                         "detail_error", product_url=str(url)
@@ -217,76 +218,10 @@ class ShoppingBrowserService:
                 item["price_text"] = detail.get("price_text", "")
 
     async def _prepare_product_detail_page(self, page: Any, platform: str) -> None:
-        await page.wait_for_timeout(self.settings.action_delay_ms)
+        """Load visible product content without executing buttons or form submissions."""
         for _ in range(2):
             await page.mouse.wheel(0, 1000)
             await page.wait_for_timeout(self.settings.action_delay_ms)
-
-        if platform == "jd":
-            await self._prepare_jd_detail_page(page)
-        else:
-            await self._prepare_taobao_detail_page(page)
-
-    async def _prepare_jd_detail_page(self, page: Any) -> None:
-        await self._click_first_available(
-            page,
-            (
-                "#detail .tab-main li:has-text('商品详情')",
-                ".tab-main li:has-text('商品详情')",
-                "a:has-text('商品详情')",
-                "li:has-text('商品详情')",
-                "#detail .tab-main li:has-text('规格参数')",
-                ".tab-main li:has-text('规格参数')",
-            ),
-            scroll_after=True,
-        )
-        await self._click_first_available(
-            page,
-            (
-                "#detail .tab-main li:has-text('商品评价')",
-                ".tab-main li:has-text('商品评价')",
-                "a:has-text('商品评价')",
-                "li:has-text('商品评价')",
-            ),
-        )
-
-    async def _prepare_taobao_detail_page(self, page: Any) -> None:
-        await self._click_first_available(
-            page,
-            (
-                "text=/^(参数|商品参数|宝贝参数|规格参数)$/",
-                "button:has-text('参数')",
-                "a:has-text('参数')",
-                "[class*='parameter' i]",
-                "[class*='params' i]",
-            ),
-        )
-        await self._click_first_available(
-            page,
-            (
-                "text=/^(评价|宝贝评价|累计评价)$/",
-                "button:has-text('评价')",
-                "a:has-text('评价')",
-            ),
-        )
-
-    async def _click_first_available(
-        self, page: Any, selectors: tuple[str, ...], *, scroll_after: bool = False
-    ) -> None:
-        for selector in selectors:
-            locator = page.locator(selector).first
-            if not await locator.count():
-                continue
-            try:
-                await locator.click(timeout=2_000)
-                await page.wait_for_timeout(self.settings.action_delay_ms)
-                if scroll_after:
-                    await page.mouse.wheel(0, 500)
-                    await page.wait_for_timeout(self.settings.action_delay_ms)
-                return True
-            except Exception:
-                continue
-        return False
 
     def _settings_for_platform(self, platform: str) -> Settings:
         if platform == "taobao":
@@ -328,47 +263,8 @@ class ShoppingBrowserService:
                 f"https://s.m.taobao.com/h5?q={quote(keyword)}"
             )
 
-        nav = await browser.navigate("https://www.taobao.com/")
-        async with browser.lock:
-            page = await browser.get_page()
-            search_box = None
-            for selector in (
-                'input[name="q"]',
-                'input[aria-label*="搜索"]',
-                'input[placeholder*="搜索"]',
-                "#q",
-            ):
-                locator = page.locator(selector).first
-                if await locator.count():
-                    search_box = locator
-                    break
-            if search_box is None:
-                return nav
-            await search_box.fill(keyword)
-            clicked = await self._click_first_available(
-                page,
-                (
-                    'button:has-text("搜索")',
-                    'input[type="submit"]',
-                    '[role="button"]:has-text("搜索")',
-                ),
-            )
-            if not clicked:
-                await search_box.press("Enter")
-            await page.wait_for_timeout(self.settings.action_delay_ms)
-            try:
-                await page.wait_for_load_state("domcontentloaded", timeout=5_000)
-            except Exception:
-                pass
-            if "s.taobao.com/search" not in page.url:
-                fallback_url = f"https://s.taobao.com/search?q={quote(keyword)}"
-                try:
-                    response = await page.goto(fallback_url, wait_until="domcontentloaded")
-                    await page.wait_for_timeout(self.settings.action_delay_ms)
-                    nav = {**nav, "http_status": response.status if response else None}
-                except Exception:
-                    pass
-            return {**nav, "url": page.url}
+        return await browser.navigate(f"https://s.taobao.com/search?q={quote(keyword)}")
+
 
 
 def _validate_platform(platform: str) -> str:

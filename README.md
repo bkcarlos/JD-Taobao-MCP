@@ -1,17 +1,18 @@
 # JD-Taobao Browser MCP
 
-一个本地运行、人工参与的 MCP Server。它通过 Playwright 打开真实、可见的 Chromium 浏览器，让 Codex 或其他 MCP 客户端在京东、淘宝、天猫页面中进行低频浏览、商品搜索、详情提取和截图。
+一个本地运行、人工参与的 MCP Server。它通过 Playwright 打开真实、可见的 Chromium 浏览器，让 Codex 或其他 MCP 客户端在京东、淘宝、天猫页面中进行低频浏览、商品搜索、详情提取。
 
-> 本项目默认只读。用户必须自己完成扫码、密码、验证码、滑块和安全验证；工具不会绕过平台风控，也不会自动购买、加购、结算或支付。
+> 本项目仅暴露商品读取工具。用户必须自己完成扫码、密码、验证码、滑块和安全验证；工具不会绕过平台风控，也不会自动购买、加购、结算或支付。
 
 ## 功能
 
 - 打开京东、淘宝登录页，并复用独立浏览器资料目录中的登录状态。
 - 搜索京东或淘宝商品，返回标题、价格、店铺、评论文本、商品链接和图片。
-- 打开商品详情页，提取标题、价格、店铺、规格、图片、产品参数、好评、差评、Meta、JSON-LD 和页面文本摘要。
+- 打开商品详情页，提取标题、价格、店铺、规格、图片、产品参数、好评和差评。只返回选定的商品字段，不导出页面全文或原始 JSON-LD。
 - 商品详情输出带硬约束：必须包含 `product_url`、`product_parameters`、`good_reviews`、`bad_reviews` 及对应 `status` 字段；`good_reviews` 最多 5 条，`bad_reviews` 最多 2 条。
-- 支持通用浏览器操作：打开 URL、页面快照、列出可交互元素、点击普通元素、普通输入、滚动、返回、截图。
-- 只允许访问 `*.jd.com`、`*.360buy.com`、`*.taobao.com`、`*.tmall.com`。
+- 链接工具只返回允许的公开链接；导航不执行网页点击事件。保留公开页面滚动。
+- 登录、订单、地址、支付和账户页面不允许向 MCP 导出内容。
+- 导航按明确的主机与路径白名单校验，资源请求按平台域名白名单校验；阻止未知第三方请求。详见 [安全边界](SECURITY.md)。
 
 ## 项目结构
 
@@ -19,9 +20,9 @@
 JD-Taobao-MCP/
 ├─ server.py                       MCP 工具入口
 ├─ jd_taobao_mcp/
-│  ├─ browser.py                   Playwright 持久化浏览器与通用操作
+│  ├─ browser.py                   Playwright 持久化浏览器与受限导航
 │  ├─ service.py                   搜索和详情页流程
-│  ├─ safety.py                    域名、敏感输入与交易动作防护
+│  ├─ safety.py                    页面、资源域名和输出链接校验
 │  └─ extractors/                  京东/淘宝页面提取器
 ├─ config_examples/
 │  ├─ codex-config.toml            Codex 配置示例
@@ -45,7 +46,7 @@ JD-Taobao-MCP/
 在 PowerShell 中执行：
 
 ```powershell
-git clone https://github.com/HaonanYu123/JD-Taobao-MCP.git
+git clone https://github.com/bkcarlos/JD-Taobao-MCP.git
 cd JD-Taobao-MCP
 Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\install_windows.ps1
@@ -104,17 +105,15 @@ default_tools_approval_mode = "prompt"
 
 [mcp_servers.jd_taobao_browser.env]
 PLAYWRIGHT_HEADLESS = "false"
-ALLOW_STATE_CHANGING_ACTIONS = "false"
 PLAYWRIGHT_BROWSERS_PATH = ".ms-playwright"
 BROWSER_PROFILE_DIR = ".tmp/browser-profile"
-ARTIFACTS_DIR = "artifacts"
 TAOBAO_SEARCH_MODE = "mobile"
 ```
 
 也可以用命令添加：
 
 ```powershell
-codex mcp add jd-taobao-browser --env PLAYWRIGHT_HEADLESS=false --env ALLOW_STATE_CHANGING_ACTIONS=false --env PLAYWRIGHT_BROWSERS_PATH=.ms-playwright --env BROWSER_PROFILE_DIR=.tmp/browser-profile --env ARTIFACTS_DIR=artifacts --env TAOBAO_SEARCH_MODE=mobile -- C:\Users\你的用户名\Desktop\JD-Taobao-MCP\.venv\Scripts\python.exe C:\Users\你的用户名\Desktop\JD-Taobao-MCP\server.py
+codex mcp add jd-taobao-browser --env PLAYWRIGHT_HEADLESS=false --env PLAYWRIGHT_BROWSERS_PATH=.ms-playwright --env BROWSER_PROFILE_DIR=.tmp/browser-profile --env TAOBAO_SEARCH_MODE=mobile -- C:\Users\你的用户名\Desktop\JD-Taobao-MCP\.venv\Scripts\python.exe C:\Users\你的用户名\Desktop\JD-Taobao-MCP\server.py
 codex mcp list
 ```
 
@@ -132,10 +131,8 @@ codex mcp list
       "args": ["<PROJECT_DIR>\\server.py"],
       "env": {
         "PLAYWRIGHT_HEADLESS": "false",
-        "ALLOW_STATE_CHANGING_ACTIONS": "false",
         "PLAYWRIGHT_BROWSERS_PATH": ".ms-playwright",
         "BROWSER_PROFILE_DIR": ".tmp/browser-profile",
-        "ARTIFACTS_DIR": "artifacts",
         "TAOBAO_SEARCH_MODE": "mobile"
       }
     }
@@ -169,17 +166,14 @@ codex mcp list
 | `browser_status` | 查看京东、淘宝浏览器状态 |
 | `open_login` | 打开京东或淘宝登录页 |
 | `check_login` | 检查是否可能已登录，不返回 Cookie 值 |
-| `open_url` | 打开允许域名下的 URL |
+| `open_url` | 打开白名单内的公开商品、搜索或首页；登录使用 `open_login` |
 | `search_products` | 搜索商品并结构化提取 |
 | `get_product_detail` | 提取商品详情，包含硬约束字段 |
-| `page_snapshot` | 获取当前页面文本、链接、表单和基础元数据 |
-| `extract_current_page` | 对当前页面执行快照和商品字段提取 |
-| `list_page_elements` | 列出当前可交互元素并分配临时 ref |
-| `click_page_element` | 点击普通元素，默认阻止交易和状态变更动作 |
-| `type_into_element` | 输入普通文本，拒绝密码、验证码、支付等敏感字段 |
+| `page_snapshot` | 仅返回当前公开页面的允许链接；`max_chars` 保留兼容但不再使用 |
+| `extract_current_page` | 对当前商品页面提取链接和选定商品字段 |
+| `list_page_elements` | 列出允许的公开链接并分配临时 ref |
+| `click_page_element` | 导航到 ref 对应的公开链接，不执行点击事件或提交表单 |
 | `scroll_page` | 页面滚动 |
-| `go_back` | 返回上一页 |
-| `take_screenshot` | 保存截图到 `ARTIFACTS_DIR` |
 | `browser_close` | 关闭浏览器 |
 
 ## 环境变量
@@ -193,25 +187,38 @@ codex mcp list
 | `TAOBAO_BROWSER_EXECUTABLE_PATH` | 空 | 单独指定淘宝/天猫浏览器路径 |
 | `TAOBAO_SEARCH_MODE` | `mobile` | 淘宝搜索模式，可选 `mobile` 或 `pc` |
 | `BROWSER_PROFILE_DIR` | `~/.jd-taobao-browser-mcp/browser-profile` | 独立浏览器资料目录 |
-| `ARTIFACTS_DIR` | `~/.jd-taobao-browser-mcp/artifacts` | 截图等产物目录 |
 | `PLAYWRIGHT_BROWSERS_PATH` | `.ms-playwright` | Playwright 浏览器下载目录 |
 | `NAVIGATION_TIMEOUT_MS` | `45000` | 页面导航超时 |
 | `ACTION_TIMEOUT_MS` | `15000` | 单步操作超时 |
 | `ACTION_DELAY_MS` | `700` | 操作间隔 |
 | `SLOW_MO_MS` | `80` | Playwright 慢动作延迟 |
-| `MAX_PAGE_TEXT_CHARS` | `18000` | 页面文本摘要最大长度 |
 | `MAX_SEARCH_RESULTS` | `30` | 单次搜索最多返回数量 |
-| `ALLOW_STATE_CHANGING_ACTIONS` | `false` | 是否允许购买、加购、关注等状态变更动作；不建议开启 |
+| `MCP_HTTP_TOKEN` | 空 | HTTP 模式必填，至少 32 个可见 ASCII 字符的独立随机令牌 |
+| `MCP_HTTP_PORT` | `8000` | HTTP 监听端口，仅绑定 `127.0.0.1` |
 | `PROXY` | 空 | 可选代理，例如 `http://127.0.0.1:7897` |
 
-## 安全边界
+## HTTP 模式
 
-- 不绕过验证码、滑块、安全验证或平台风控。
-- 不注入反检测脚本，不伪造浏览器环境。
-- 不读取或返回 Cookie 值，只在登录检查时返回 Cookie 名称。
-- 密码、验证码、支付密码、银行卡、身份证、OTP 等字段禁止自动输入。
-- 默认拒绝购买、加购、结算、支付、关注、收藏、删除和账户信息修改。
-- 不适合高频、大规模采集。
+默认使用 stdio。本机 HTTP 模式需要访问令牌：
+
+```powershell
+$env:MCP_HTTP_TOKEN = (.\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(32))")
+.\.venv\Scripts\python.exe server.py --http
+```
+
+客户端连接 `http://127.0.0.1:8000/mcp`，在每个请求中发送 `Authorization: Bearer <MCP_HTTP_TOKEN>`。令牌只能保存在客户端的私有配置中，不要放入 URL 或提交到 Git。缺少令牌时服务拒绝启动；请求缺少或使用错误令牌时返回 401。所有持有令牌的客户端共享同一浏览器会话，不支持多用户隔离。
+
+跨机器访问需要自行配置可信的 TLS 反向代理或加密隧道，保留认证头，避免明文传输令牌。优先在同一台机器上使用 stdio。
+
+## 安全边界与兼容性变化（0.1.1）
+
+- 登录必须由用户直接在浏览器完成，不返回密码、验证码、输入框值、Cookie 名称或 Cookie 值。
+- 移除 `type_into_element`、`take_screenshot`、`go_back`；不再使用按钮点击或回车提交表单。旧配置启用 `ALLOW_STATE_CHANGING_ACTIONS=true` 会拒绝启动。
+- 快照只返回公开链接。详情不再返回全文或原始 JSON-LD，也不再从整页正文猜测参数与评论。需要点击展开才能读取的内容可能返回空数组及状态原因。
+- 请求在发出前检查白名单。导航重定向转换为重新检查的 GET 导航；资源重定向及需要保留请求体的 307/308 跳转被拒绝。WebSocket、Service Worker 和下载被禁用。
+- 严格策略可能阻止部分登录、验证码或 CDN 流程；不要为恢复功能而改成允许所有域名。本版本没有使用真实购物账号验证平台兼容性。
+- 商品页面内容仍是不可信外部数据，不能当作工具指令。站点自身脚本仍会在允许的平台域名间发请求，因此这不是完整的浏览器网络沙箱，也不保证网站侧零状态变化。
+- 浏览器资料目录包含登录状态，默认保存在本机；不要共享、上传或提交。详见 [SECURITY.md](SECURITY.md)。
 
 ## 常见问题
 
@@ -230,12 +237,22 @@ GitHub 只会把仓库根目录的 `README.md` 显示在项目主页。详细文
 ## 开发命令
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
 ```powershell
 .\scripts\start_windows.bat
 ```
+
+启用离线 Chromium 回归测试（仅使用合成页面和本机测试服务器）：
+
+```powershell
+.\.venv\Scripts\python.exe -m playwright install chromium
+$env:MCP_BROWSER_TESTS = "1"
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+CI 会运行这两类测试；本地也可用 `MCP_BROWSER_TEST_EXECUTABLE` 指定测试浏览器。测试不会访问真实商城或使用登录资料。
 
 ## License
 

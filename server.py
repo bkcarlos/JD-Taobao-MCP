@@ -17,20 +17,24 @@ if playwright_browsers_path:
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(PROJECT_ROOT / browsers_path)
 
 from mcp.server.fastmcp import FastMCP
+import uvicorn
 
 from jd_taobao_mcp.config import Settings
 from jd_taobao_mcp.service import ShoppingBrowserService
+from jd_taobao_mcp.http_auth import BearerAuth
+from jd_taobao_mcp.safety import ensure_readable_url
 
 settings = Settings.from_env()
 service = ShoppingBrowserService(settings)
 
 mcp = FastMCP(
     "JD-Taobao-Browser",
+    host="127.0.0.1",
     instructions=(
         "用于在用户本机可见浏览器中浏览京东、淘宝和天猫，并提取页面与商品数据。"
         "必须让用户自己完成扫码、密码、验证码和安全验证。"
-        "默认只读：不得购买、加入购物车、结算、支付、关注、收藏、删除或修改账户信息。"
-        "优先使用 search_products 和 get_product_detail；只有页面结构变化时才使用通用点击工具。"
+        "仅提供商品读取：不得购买、加入购物车、结算、支付、关注、收藏、删除或修改账户信息。"
+        "使用 search_products 和 get_product_detail；链接工具仅导航到公开页面，不执行点击事件。"
         "商品详情输出有硬约束：必须包含 product_url、product_parameters、good_reviews、bad_reviews "
         "及对应 status 字段；good_reviews 目标最多 5 条，bad_reviews 目标最多 2 条；"
         "缺失或不足时必须用空数组或不足目标条数和 status.reason 说明原因。"
@@ -47,7 +51,7 @@ async def browser_start() -> dict[str, Any]:
 
 @mcp.tool()
 async def browser_status() -> dict[str, Any]:
-    """查看浏览器是否运行、当前页面和资料目录。"""
+    """查看浏览器是否运行、当前公开页面地址。"""
     return {
         "jd": await service.jd_browser.status(),
         "taobao": await service.taobao_browser.status(),
@@ -67,7 +71,7 @@ async def open_login(platform: str) -> dict[str, Any]:
 
 @mcp.tool()
 async def check_login(platform: str) -> dict[str, Any]:
-    """根据页面与 Cookie 名称判断京东或淘宝是否可能已登录，不返回 Cookie 值。
+    """根据 Cookie 是否存在判断京东或淘宝是否可能已登录，不返回 Cookie 名称和值。
 
     Args:
         platform: jd 或 taobao。
@@ -78,9 +82,10 @@ async def check_login(platform: str) -> dict[str, Any]:
 
 @mcp.tool()
 async def open_url(url: str) -> dict[str, Any]:
-    """打开京东、淘宝或天猫 URL。其他域名会被拒绝。"""
+    """打开允许的公开商品、搜索或首页；登录请使用 open_login。"""
     from jd_taobao_mcp.service import platform_from_url
 
+    ensure_readable_url(url)
     platform = platform_from_url(url)
     return await service._browser_for_platform(platform).navigate(url)
 
@@ -126,7 +131,7 @@ async def get_product_detail(url: str) -> dict[str, Any]:
 
 @mcp.tool()
 async def page_snapshot(max_chars: int | None = None) -> dict[str, Any]:
-    """获取当前页面可见文本、链接、表单和基础元数据。"""
+    """仅返回公开页面的允许链接，不返回正文、表单或输入值。"""
     return await service.browser.snapshot(max_chars=max_chars)
 
 
@@ -138,46 +143,20 @@ async def extract_current_page() -> dict[str, Any]:
 
 @mcp.tool()
 async def list_page_elements(limit: int = 80) -> dict[str, Any]:
-    """列出当前页面可见的链接、按钮、输入框等，并分配短期 ref。"""
+    """仅列出公开页面的允许链接；不包含按钮、输入框和输入值。"""
     return await service.browser.list_elements(limit=limit)
 
 
 @mcp.tool()
 async def click_page_element(ref: str) -> dict[str, Any]:
-    """点击 list_page_elements 返回的 ref。
-
-    默认阻止购买、结算、支付、购物车、收藏、关注、删除、地址变更等动作。
-    """
+    """导航到 ref 对应的公开链接，不执行网页点击事件或提交表单。"""
     return await service.browser.click(ref)
-
-
-@mcp.tool()
-async def type_into_element(
-    ref: str, text: str, press_enter: bool = False
-) -> dict[str, Any]:
-    """向当前页面的普通输入框输入文字，可选择按回车。
-
-    密码、验证码、银行卡、身份证和支付认证字段会被拒绝。
-    """
-    return await service.browser.type_text(ref, text, press_enter=press_enter)
 
 
 @mcp.tool()
 async def scroll_page(direction: str = "down", amount: int = 900) -> dict[str, Any]:
     """向上或向下滚动当前页面。"""
     return await service.browser.scroll(direction=direction, amount=amount)
-
-
-@mcp.tool()
-async def go_back() -> dict[str, Any]:
-    """返回浏览器历史中的上一页。"""
-    return await service.browser.go_back()
-
-
-@mcp.tool()
-async def take_screenshot(full_page: bool = False) -> dict[str, Any]:
-    """将当前页面截图保存到本地 artifacts 目录。"""
-    return await service.browser.screenshot(full_page=full_page)
 
 
 @mcp.tool()
@@ -192,7 +171,11 @@ async def browser_close() -> dict[str, Any]:
 
 def main() -> None:
     if "--http" in sys.argv:
-        mcp.run(transport="streamable-http")
+        app = BearerAuth(mcp.streamable_http_app(), os.environ.get("MCP_HTTP_TOKEN", ""))
+        port = int(os.environ.get("MCP_HTTP_PORT", "8000"))
+        if not 1 <= port <= 65535:
+            raise ValueError("MCP_HTTP_PORT must be between 1 and 65535.")
+        uvicorn.run(app, host="127.0.0.1", port=port, access_log=False)
     else:
         mcp.run(transport="stdio")
 

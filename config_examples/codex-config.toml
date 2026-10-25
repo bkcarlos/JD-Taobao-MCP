@@ -11,8 +11,6 @@ default_tools_approval_mode = "prompt"
 
 [mcp_servers.jd_taobao_browser.env]
 PLAYWRIGHT_HEADLESS = "false"
-ALLOW_STATE_CHANGING_ACTIONS = "false"
 PLAYWRIGHT_BROWSERS_PATH = ".ms-playwright"
 BROWSER_PROFILE_DIR = ".tmp/browser-profile"
-ARTIFACTS_DIR = "artifacts"
 TAOBAO_SEARCH_MODE = "mobile"

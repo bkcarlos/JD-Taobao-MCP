@@ -1,157 +1,138 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from urllib.parse import urlparse
-
-
-_ALLOWED_ROOT_DOMAINS = (
-    "jd.com",
-    "360buy.com",
-    "taobao.com",
-    "tmall.com",
-)
-
-_BLOCKED_SCHEMES = {"file", "ftp", "data", "javascript", "chrome", "edge"}
-
-# MCP 的模型参数不能替代真实用户确认，因此默认直接阻止可能产生账户或交易状态变化的动作。
-_STATE_CHANGING_PATTERNS = (
-    r"立即购买",
-    r"购买",
-    r"加入购物车",
-    r"购物车",
-    r"提交订单",
-    r"确认订单",
-    r"去结算",
-    r"结算",
-    r"支付",
-    r"付款",
-    r"确认收货",
-    r"申请退款",
-    r"退款",
-    r"退货",
-    r"充值",
-    r"转账",
-    r"开通白条",
-    r"借款",
-    r"收藏",
-    r"关注店铺",
-    r"关注",
-    r"取消关注",
-    r"删除",
-    r"注销",
-    r"退出登录",
-    r"修改密码",
-    r"新增地址",
-    r"修改地址",
-    r"保存地址",
-    r"提交评价",
-    r"发布评价",
-    r"领券",
-    r"领取优惠券",
-)
-_STATE_CHANGING_RE = re.compile("|".join(_STATE_CHANGING_PATTERNS), re.I)
-
-_SENSITIVE_INPUT_RE = re.compile(
-    r"密码|验证码|短信码|动态码|安全码|支付密码|银行卡|身份证|CVV|CVC|OTP",
-    re.I,
-)
-
-_VERIFICATION_RE = re.compile(
-    r"滑块|安全验证|异常访问|访问过于频繁|请完成验证|请先验证|输入验证码|获取验证码|验证码错误|captcha|人机验证|拖动.*验证",
-    re.I,
-)
-
-
-_VERIFICATION_RE = re.compile(
-    r"滑块|安全验证|异常访问|访问过于频繁|请完成验证|请先验证|"
-    r"拖动下方滑块|拖动到最右边|验证失败|点击框体重试|"
-    r"captcha|人机验证|drag.*verify|verification failed",
-    re.I,
-)
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 
 class SafetyError(RuntimeError):
-    """Raised when an action violates the MCP server safety boundary."""
+    """An operation exceeds the product reader's access boundary."""
 
 
-@dataclass(frozen=True, slots=True)
-class ElementSafetyMetadata:
-    text: str = ""
-    aria_label: str = ""
-    title: str = ""
-    value: str = ""
-    href: str = ""
-    input_type: str = ""
-    placeholder: str = ""
-    name: str = ""
+# Public pages only: sharing a domain with a shop does not make account pages safe.
+_PUBLIC_PATHS = {
+    "www.jd.com": r"/",
+    "item.jd.com": r"/\d+\.html",
+    "search.jd.com": r"/Search/?",
+    "www.taobao.com": r"/",
+    "s.taobao.com": r"/search/?",
+    "s.m.taobao.com": r"/h5/?",
+    "item.taobao.com": r"/item\.htm",
+    "item.m.taobao.com": r"/item\.htm",
+    "new.m.taobao.com": r"/detail\.htm",
+    "detail.tmall.com": r"/item\.htm",
+}
+_LOGIN_HOSTS = {"passport.jd.com", "plogin.m.jd.com", "login.taobao.com"}
+_RESOURCE_ROOTS = (
+    "jd.com", "360buy.com", "360buyimg.com", "jdimg.com", "jdstatic.com",
+    "taobao.com", "tmall.com", "alicdn.com", "aliimg.com", "tbcdn.cn",
+)
+_QUERY_KEYS = {"id", "sku", "keyword", "q", "page", "s", "sort"}
+_VERIFICATION_RE = re.compile(
+    r"滑块|安全验证|异常访问|访问过于频繁|请完成验证|请先验证|输入验证码|获取验证码|"
+    r"验证码错误|拖动下方滑块|拖动到最右边|验证失败|点击框体重试|"
+    r"captcha|人机验证|drag.*verify|verification failed", re.I,
+)
 
-    def combined_text(self) -> str:
-        return " ".join(
-            part
-            for part in (
-                self.text,
-                self.aria_label,
-                self.title,
-                self.value,
-                self.href,
-                self.placeholder,
-                self.name,
-            )
-            if part
-        )
+
+def _parse_https(url: str):
+    """Reject credentials, ambiguous authorities and insecure transports."""
+    try:
+        if any(ord(c) <= 32 for c in url) or "\\" in url:
+            return None
+        parsed = urlparse(url)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
+                or parsed.password is not None or parsed.port not in (None, 443)):
+            return None
+        return parsed
+    except ValueError:
+        return None
 
 
-def _host_matches(host: str, root: str) -> bool:
-    host = host.lower().rstrip(".")
-    return host == root or host.endswith("." + root)
+def is_readable_url(url: str) -> bool:
+    """Only public product, search and home pages can return data to MCP."""
+    parsed = _parse_https(url)
+    if parsed is None:
+        return False
+    pattern = _PUBLIC_PATHS.get(parsed.hostname, r"(?!)")
+    return re.fullmatch(pattern, parsed.path or "/") is not None
 
 
 def is_allowed_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return False
-    if parsed.scheme.lower() in _BLOCKED_SCHEMES:
-        return False
-    if parsed.scheme.lower() not in {"http", "https"}:
-        return False
-    host = (parsed.hostname or "").lower()
-    return any(_host_matches(host, root) for root in _ALLOWED_ROOT_DOMAINS)
+    """Allow public pages and official login pages for manual sign-in."""
+    parsed = _parse_https(url)
+    return parsed is not None and (is_readable_url(url) or parsed.hostname in _LOGIN_HOSTS)
 
 
-def ensure_allowed_url(url: str) -> str:
-    if not is_allowed_url(url):
-        raise SafetyError(
-            "仅允许访问京东、淘宝和天猫域名；不允许 file://、本地地址或任意第三方网站。"
-        )
+def ensure_product_url(url: str) -> str:
+    """Detail extraction is not a generic account-page scraper."""
+    parsed = _parse_https(url)
+    if not is_readable_url(url) or parsed.hostname not in {
+        "item.jd.com", "item.taobao.com", "item.m.taobao.com",
+        "new.m.taobao.com", "detail.tmall.com",
+    }:
+        raise SafetyError("详情工具仅接受公开商品链接。")
     return url
 
 
-def ensure_click_allowed(
-    metadata: ElementSafetyMetadata,
-    *,
-    allow_state_changing_actions: bool,
-) -> None:
-    if allow_state_changing_actions:
-        return
-    combined = metadata.combined_text()
-    if _STATE_CHANGING_RE.search(combined):
-        raise SafetyError(
-            "该元素可能引发购买、结算、支付、购物车、关注、删除或其他账户状态变化，"
-            "当前服务器按只读模式阻止了此次点击。"
-        )
+def ensure_allowed_url(url: str) -> str:
+    """Validate navigation before any request is made."""
+    if not is_allowed_url(url):
+        raise SafetyError("仅允许 HTTPS 商品、搜索、首页及官方登录页；禁止账户和第三方页面。")
+    return url
 
 
-def ensure_typing_allowed(metadata: ElementSafetyMetadata) -> None:
-    if metadata.input_type.lower() == "password":
-        raise SafetyError("禁止通过 MCP 向密码框输入内容，请在浏览器窗口中手动完成登录。")
-    if _SENSITIVE_INPUT_RE.search(metadata.combined_text()):
-        raise SafetyError(
-            "禁止通过 MCP 输入密码、验证码、银行卡、身份证或其他敏感认证信息；"
-            "请在浏览器窗口中手动输入。"
-        )
+def ensure_readable_url(url: str) -> str:
+    """Do not export login, verification, account or unrelated page contents."""
+    if not is_readable_url(url):
+        raise SafetyError("此页面不允许向 MCP 导出内容；请在本机浏览器中处理登录或账户信息。")
+    return url
+
+
+def public_url(url: str) -> str:
+    """Return a public navigation URL without fragments or tracking/auth parameters."""
+    ensure_readable_url(url)
+    parsed = urlparse(url)
+    query = urlencode([(k, v) for k, v in parse_qsl(parsed.query) if k in _QUERY_KEYS])
+    return urlunparse(("https", parsed.hostname, parsed.path or "/", "", query, ""))
+
+
+def display_url(url: str) -> str:
+    """Status responses must not expose OAuth codes or other URL credentials."""
+    if is_readable_url(url):
+        return public_url(url)
+    if is_allowed_url(url):
+        parsed = urlparse(url)
+        return f"https://{parsed.hostname}{parsed.path}"
+    return ""
+
+
+def product_link(url: str | None) -> str | None:
+    """Filter extracted product links before returning them or navigating."""
+    try:
+        return public_url(ensure_product_url(url or ""))
+    except SafetyError:
+        return None
+
+
+def image_link(url: str | None) -> str | None:
+    """Do not make MCP clients load third-party tracking URLs from page content."""
+    if not url or not is_allowed_request(url, navigation=False):
+        return None
+    parsed = urlparse(url)
+    return urlunparse(("https", parsed.hostname, parsed.path, "", "", ""))
+
+
+def is_allowed_request(url: str, *, navigation: bool) -> bool:
+    """Check each request, including redirects, before leaving the browser."""
+    if navigation:
+        return is_allowed_url(url)
+    parsed = _parse_https(url)
+    return parsed is not None and any(
+        parsed.hostname == root or parsed.hostname.endswith("." + root)
+        for root in _RESOURCE_ROOTS
+    )
 
 
 def page_requires_user_verification(text: str, url: str = "") -> bool:
+    """Detect common challenges as a usability hint, not an authorization check."""
     return bool(_VERIFICATION_RE.search(f"{url}\n{text[:5000]}"))
