@@ -87,6 +87,18 @@ class UrlTests(unittest.TestCase):
                         url.replace("03101900", "other"), url.replace("/privatedomain/", "/account/")):
             self.assertFalse(is_jd_verification_page(invalid))
 
+    def test_account_certification_is_exact_and_never_public(self):
+        url = "https://aq.jd.com/certified/index?ticket=FAKE"
+        self.assertTrue(is_jd_verification_page(url))
+        self.assertFalse(is_allowed_url(url))
+        self.assertFalse(is_readable_url(url))
+        self.assertEqual(display_url(url), "")
+        for invalid in ("https://aq.jd.com/", "https://aq.jd.com/account",
+                        "https://aq.jd.com/certified/index/../account", "http://aq.jd.com/certified/index",
+                        "https://aq.jd.com.evil.example/certified/index",
+                        "https://user:pass@aq.jd.com/certified/index"):
+            self.assertFalse(is_jd_verification_page(invalid))
+
 
 class BrowserTests(unittest.IsolatedAsyncioTestCase):
     def controller(self, url="https://item.jd.com/123.html"):
@@ -162,6 +174,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_checkpoint_does_not_interrupt_pending_sso_or_verification(self):
         for url in ("https://sso.jd.com/setCookie?token=FAKE",
+                    "https://aq.jd.com/certified/index?ticket=FAKE",
                     "https://cfe.m.jd.com/privatedomain/risk_handler/03101900/?token=FAKE"):
             c, page = self.controller(url)
             c._page = page

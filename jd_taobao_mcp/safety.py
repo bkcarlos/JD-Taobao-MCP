@@ -71,10 +71,11 @@ def is_jd_login_callback(url: str) -> bool:
 
 
 def is_jd_verification_page(url: str) -> bool:
-    """Recognize the fixed risk-verification document observed in JD redirects."""
+    """Recognize only verification documents observed in JD login/search redirects."""
     parsed = _parse_https(url)
-    return (parsed is not None and parsed.hostname == "cfe.m.jd.com"
-            and parsed.path == "/privatedomain/risk_handler/03101900/")
+    paths = {"cfe.m.jd.com": "/privatedomain/risk_handler/03101900/",
+             "aq.jd.com": "/certified/index"}
+    return parsed is not None and parsed.path == paths.get(parsed.hostname)
 
 
 def ensure_product_url(url: str) -> str:

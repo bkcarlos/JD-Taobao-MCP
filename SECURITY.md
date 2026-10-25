@@ -77,9 +77,10 @@ While that human session is active, main-frame GET navigation may also visit the
 HTTPS endpoint `sso.jd.com/setCookie`, used by JD's login script for its SSO cookie handoff.
 Every subsequent redirect is checked again. This exception does not permit other SSO
 paths, iframe navigation, POST replay, MCP navigation, or reading the callback page.
-The same scoped navigation rule permits the observed verification document at
-`cfe.m.jd.com/privatedomain/risk_handler/03101900/`. Only the authenticated human portal
-can view or interact with that document. Password autofill remains restricted to the
+The same scoped navigation rule permits the observed verification documents at
+`cfe.m.jd.com/privatedomain/risk_handler/03101900/` and `aq.jd.com/certified/index`.
+Only the authenticated human portal can view or interact with those documents.
+Password autofill remains restricted to the
 original login form; verification pages, their parameters and contents are never exported
 to MCP. This supports manual verification and does not bypass a platform rejection.
 

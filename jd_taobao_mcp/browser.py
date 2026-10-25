@@ -75,7 +75,7 @@ class BrowserController:
             self.login_navigation_blocked = True
         # Even arbitrary hostnames can contain identifiers. Export only these
         # literal public hostnames; this list does not grant navigation access.
-        known_hosts = {"passport.jd.com", "plogin.m.jd.com", "safe.jd.com", "sso.jd.com", "cfe.m.jd.com",
+        known_hosts = {"passport.jd.com", "plogin.m.jd.com", "safe.jd.com", "sso.jd.com", "cfe.m.jd.com", "aq.jd.com",
                        "www.jd.com", "item.jd.com", "search.jd.com", "login.taobao.com"}
         try:
             parsed = urlparse(url)

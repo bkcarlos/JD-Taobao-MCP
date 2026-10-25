@@ -139,15 +139,17 @@ class BrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await controller.human_login_pointer([{'x':(box['x']+box['width']/2)/size['width'],
                                                'y':(box['y']+box['height']/2)/size['height'],'t':0}])
         self.assertEqual(await self.page.evaluate('window.submitted'),2)
-        await self.page.goto("https://cfe.m.jd.com/privatedomain/risk_handler/03101900/?token=FAKE")
-        self.assertTrue((await controller.human_login_view()).startswith(b'\x89PNG'))
-        with self.assertRaises(SafetyError):
-            await controller.submit_password('FAKE_USER','FAKE_PASSWORD')
-        self.assertEqual(await self.page.locator('#nloginpwd').input_value(),'')
-        box=await self.page.locator('#loginsubmit').bounding_box()
-        await controller.human_login_pointer([{'x':(box['x']+box['width']/2)/size['width'],
-                                               'y':(box['y']+box['height']/2)/size['height'],'t':0}])
-        self.assertEqual(await self.page.evaluate('window.submitted'),1)
+        for verification_url in ("https://cfe.m.jd.com/privatedomain/risk_handler/03101900/?token=FAKE",
+                                 "https://aq.jd.com/certified/index?ticket=FAKE"):
+            await self.page.goto(verification_url)
+            self.assertTrue((await controller.human_login_view()).startswith(b'\x89PNG'))
+            with self.assertRaises(SafetyError):
+                await controller.submit_password('FAKE_USER','FAKE_PASSWORD')
+            self.assertEqual(await self.page.locator('#nloginpwd').input_value(),'')
+            box=await self.page.locator('#loginsubmit').bounding_box()
+            await controller.human_login_pointer([{'x':(box['x']+box['width']/2)/size['width'],
+                                                   'y':(box['y']+box['height']/2)/size['height'],'t':0}])
+            self.assertEqual(await self.page.evaluate('window.submitted'),1)
         await controller.end_login()
         self.assertEqual(self.page.url,'about:blank')
         with self.assertRaises(SafetyError):await controller.human_login_view()
