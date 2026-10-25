@@ -10,7 +10,7 @@ from jd_taobao_mcp.browser import BrowserController
 from jd_taobao_mcp.config import Settings
 from jd_taobao_mcp.extractors.detail import extract_product_detail
 from jd_taobao_mcp.extractors.search import extract_jd_search, extract_taobao_search
-from jd_taobao_mcp.http_auth import BearerAuth
+from jd_taobao_mcp.http_auth import BearerAuth, http_transport_security
 from jd_taobao_mcp.safety import (
     SafetyError, display_url, ensure_product_url, is_allowed_request,
     is_allowed_url, is_readable_url, public_url,
@@ -255,6 +255,38 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
                 r = await client.post("/mcp", headers={"Mcp-Session-Id": session_id},
                                       json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
                 self.assertEqual(r.status_code, 401)
+
+    def test_extra_hosts_reject_broad_or_invalid_values(self):
+        for value in ("*", "shopping-mcp:*", "https://shopping-mcp:8000", "user@shopping-mcp",
+                      "shopping-mcp/path", "shopping-mcp:0", "shopping-mcp:65536", "a..b",
+                      "-bad:8000", "a\r\nb", "shopping-mcp:8000,"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                http_transport_security(value)
+        settings = http_transport_security("shopping-mcp:8000,other.example:9000")
+        self.assertIn("127.0.0.1:*", settings.allowed_hosts)
+        self.assertIn("other.example:9000", settings.allowed_hosts)
+        self.assertNotIn("http://shopping-mcp:8000", settings.allowed_origins)
+
+    async def test_exact_service_host_can_initialize_without_broadening_origin_access(self):
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("fixture", transport_security=http_transport_security("shopping-mcp:8000"))
+        inner = mcp.streamable_http_app()
+        token = "test-only-" + "x" * 40
+        app = BearerAuth(inner, token)
+        payload = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                   "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                              "clientInfo": {"name": "fixture", "version": "1"}}}
+        async with inner.router.lifespan_context(inner):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                         base_url="http://shopping-mcp:8000") as client:
+                headers = {"Authorization": "Bearer " + token, "Accept": "application/json, text/event-stream"}
+                self.assertEqual((await client.post("/mcp", headers=headers, json=payload)).status_code, 200)
+                for host in ("unknown.example:8000", "shopping-mcp:9000", "shopping-mcp.evil.example:8000"):
+                    response = await client.post("/mcp", headers={**headers, "Host": host}, json=payload)
+                    self.assertEqual(response.status_code, 421)
+                response = await client.post("/mcp", headers={**headers, "Origin": "https://evil.example"}, json=payload)
+                self.assertEqual(response.status_code, 403)
+                self.assertEqual((await client.post("/mcp", json=payload)).status_code, 401)
 
     async def test_removed_tools_are_not_advertised(self):
         import server

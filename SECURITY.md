@@ -32,6 +32,8 @@ Prefer stdio on the same machine. A client allowed to launch the server can use 
 
 HTTP mode defaults to `127.0.0.1` and requires an independent random `MCP_HTTP_TOKEN` of at least 32 visible ASCII characters. Every HTTP path and method requires the exact `Authorization: Bearer <token>` header, including requests carrying a session ID. Missing, duplicate or invalid authorization headers are rejected. Tokens in query strings are not accepted. Access logs are disabled.
 
+For server-to-server connections on a private Docker network, `MCP_HTTP_EXTRA_HOSTS` adds comma-separated exact Host values (for example `shopping-mcp:8000`). Wildcards, URLs and invalid ports are rejected. This does not expand the Origin allowlist or disable authentication and DNS rebinding protection.
+
 `MCP_HTTP_HOST` can explicitly change the listening address for a container. The supplied Compose file binds inside the container to `0.0.0.0` but publishes only on the host loopback address. Host/Origin validation remains enabled. The container runs as a non-root user with all capabilities dropped, a read-only root filesystem and a private persistent data volume. Chromium sandboxing remains enabled; the bundled Playwright seccomp profile permits its user namespaces without using privileged mode.
 
 All authenticated clients share the same browser session. This is not a multi-user authorization scheme or an OAuth authorization server. Do not share the token between unrelated users. For remote use, provide a trusted TLS reverse proxy or encrypted tunnel, preserve authentication headers, and restrict network access. Never expose the port through an unauthenticated forwarding service. Rotate the token by updating the server and client configuration and restarting the server.

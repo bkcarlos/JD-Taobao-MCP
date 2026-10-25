@@ -195,6 +195,7 @@ codex mcp list
 | `MAX_SEARCH_RESULTS` | `30` | 单次搜索最多返回数量 |
 | `MCP_HTTP_TOKEN` | 空 | HTTP 模式必填，至少 32 个可见 ASCII 字符的独立随机令牌 |
 | `MCP_HTTP_HOST` | `127.0.0.1` | HTTP 监听地址；Docker 内使用 `0.0.0.0`，宿主机映射仍为回环地址 |
+| `MCP_HTTP_EXTRA_HOSTS` | 空 | 额外允许的精确 Host，逗号分隔，例如 `shopping-mcp:8000`；不允许通配符，不扩大 Origin 白名单 |
 | `MCP_HTTP_PORT` | `8000` | HTTP 监听端口，仅绑定 `127.0.0.1` |
 | `PROXY` | 空 | 可选代理，例如 `http://127.0.0.1:7897` |
 

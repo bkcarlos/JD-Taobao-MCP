@@ -21,7 +21,7 @@ import uvicorn
 
 from jd_taobao_mcp.config import Settings
 from jd_taobao_mcp.service import ShoppingBrowserService
-from jd_taobao_mcp.http_auth import BearerAuth
+from jd_taobao_mcp.http_auth import BearerAuth, http_transport_security
 from jd_taobao_mcp.safety import ensure_readable_url
 
 settings = Settings.from_env()
@@ -30,6 +30,7 @@ service = ShoppingBrowserService(settings)
 mcp = FastMCP(
     "JD-Taobao-Browser",
     host="127.0.0.1",
+    transport_security=http_transport_security(os.getenv("MCP_HTTP_EXTRA_HOSTS", "")),
     instructions=(
         "用于在用户本机可见浏览器中浏览京东、淘宝和天猫，并提取页面与商品数据。"
         "必须让用户自己完成扫码、密码、验证码和安全验证。"
