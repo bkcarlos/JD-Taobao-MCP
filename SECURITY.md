@@ -22,10 +22,14 @@ are blocked. No tool clicks, changes quantities/selection, claims coupons, delet
 or proceeds to checkout. Platform query behavior is still controlled by JD.
 
 The response includes only merchandise fields, nested bundle components, displayed gift
-items and the selected-items estimate. Component standalone reference prices are not
+items, structured availability and the selected-items estimate. Bundle stock uses its
+virtual SKU rather than component stock; unrecognized stock signals remain unknown.
+Component standalone reference prices are not
 presented as allocated bundle prices. Main cart entries, component rows, gift rows and
 gift quantities have separate counts. Missing nested details or inconsistent counts
-produce a partial result instead of a completeness claim. Account
+produce a partial result. Coverage reports the desktop source and bounded provider counts;
+account-wide completeness remains unverified even when this response is fully parsed.
+User-reported missing main products cannot be accounted for using gifts or bundle components. Account
 identifiers, addresses, cookie values, internal item identifiers, provider errors and the
 raw response are discarded. Cart contents are private data delivered to the authorized
 MCP client/model; they are not public product results. The server does not persist them,

@@ -69,6 +69,34 @@ def _quantity(value: Any) -> int | None:
     return value if type(value) is int and 1 <= value <= 1_000_000 else None
 
 
+def _count(value: Any) -> int | None:
+    """Expose bounded provider counts without coercing unknown values to zero."""
+    return value if type(value) is int and 0 <= value <= 1_000_000 else None
+
+
+def _availability(raw: dict | None, bundle: bool) -> str:
+    """Read structured stock signals; a bundle uses its virtual SKU, not its children."""
+    if not isinstance(raw, dict):
+        return "unknown"
+    if bundle:
+        raw = raw.get("vskuSelf")
+        if not isinstance(raw, dict):
+            return "unknown"
+    unusable = raw.get("unusableType")
+    if type(unusable) is int and unusable in {1, 2, 4, 6}:
+        return "unavailable"
+    stock = raw.get("stock")
+    state = stock.get("stockStateId") if isinstance(stock, dict) else None
+    code = raw.get("stockCode")
+    if type(code) is not int or type(state) is not int:
+        return "unknown"
+    if code == 1 and state == 34:
+        return "out_of_stock"
+    if code == 0 and state == 33:
+        return "in_stock"
+    return "unknown"
+
+
 def _nested_details(raw: dict[str, Any], depth: int = 0) -> tuple[list, list, bool]:
     """Read bundle components and displayed gift groups without unrelated metadata."""
     if depth >= 4:
@@ -211,6 +239,7 @@ def normalize_cart(payload: Any, max_items: int) -> dict[str, Any]:
                 "selected": row.get("checked") if type(row.get("checked")) is bool else None,
                 "shop": _text(vendor.get("title"), 120),
                 "kind": "bundle" if row.get("itemType") == 4 else "product",
+                "availability": _availability(raw, row.get("itemType") == 4),
                 "components": components, "gifts": gifts,
             })
     if not items and not empty:
@@ -219,8 +248,8 @@ def normalize_cart(payload: Any, max_items: int) -> dict[str, Any]:
         return cart_failure("unrecognized_cart_response")
     page = business.get("page")
     pages = page.get("totalPageNum") if isinstance(page, dict) else None
-    reported_count = cart_info.get("cartShowNum") if isinstance(cart_info, dict) else None
-    count_mismatch = type(reported_count) is int and reported_count != len(items)
+    reported_count = _count(cart_info.get("cartShowNum")) if isinstance(cart_info, dict) else None
+    count_mismatch = reported_count is not None and reported_count != len(items)
     partial |= (not empty and (type(pages) is not int or pages != 1)) or len(items) > max_items
     partial |= not details_complete or count_mismatch
     balance = business.get("balanceInfo")
@@ -234,9 +263,13 @@ def normalize_cart(payload: Any, max_items: int) -> dict[str, Any]:
         "bundle_count": sum(i["kind"] == "bundle" for i in returned),
         "component_count": component_count, "gift_count": gift_count, "gift_quantity": gift_quantity,
         "details_complete": details_complete,
+        "availability_counts": {state: sum(i["availability"] == state for i in returned)
+                                for state in ("in_stock", "out_of_stock", "unavailable", "unknown")},
+        "coverage": {"source": "jd_desktop_cart", "reported_main_count": reported_count,
+                     "reported_page_count": _count(pages), "account_cart_complete": None},
         "selected_total": selected_total, "currency": "CNY",
         "fetched_at": datetime.now(timezone.utc).isoformat(),
-        "note": "count 是主条目数，套装计为一个主条目；components 是套装内明细，gifts 是附属赠品。gift_count 是赠品明细条数，gift_quantity 是赠品件数。必须同时报告主条目和赠品；不能把 count 称为全部商品件数。组件价格未知时不能用单买参考价替代套装分摊价。selected_total 仅为已勾选商品估价，不重复加上组件或赠品。partial=true 或 details_complete=false 时不得称列表完整；最终实付以结算页为准。",
+        "note": "count 只计本次京东网页版响应的主条目，套装计为一条；components 是套装组成，gifts 是赠品，不能拿它们补足缺失的主商品。gift_count 是赠品条数，gift_quantity 是赠品件数。availability 为库存状态，unknown 不能推断有货。partial 和 details_complete 只检查本次响应，coverage.account_cart_complete=null 表示尚未核实整个账号的购物车；即使只返回一页，也不能声称全部清单完整。用户报告的主商品数与 count 不同时，应明确指出差异未解决。组件价格未知时不能用单买参考价替代分摊价。selected_total 仅为已勾选商品估价，不重复加组件或赠品；最终实付以结算页为准。",
     }
 
 

@@ -41,6 +41,63 @@ class CartContractTests(unittest.TestCase):
         self.assertEqual(result["items"][0]["variant"], "Black Small")
         self.assertEqual(result["selected_total"], 99.0)
         self.assertTrue(result["items"][0]["selected"])
+        self.assertEqual(result["coverage"], {"source": "jd_desktop_cart", "reported_main_count": 1,
+                                             "reported_page_count": 1, "account_cart_complete": None})
+        self.assertNotIn("FAKE_", json.dumps(result))
+
+    def test_nine_main_rows_include_unavailable_product_and_bundle(self):
+        data = fixture()
+        vendor = data["businessData"]["cartPage"]["vendorList"][0]
+        raw_vendor = data["resultData"]["cartInfo"]["vendors"][0]
+        vendor["items"] = []
+        raw_vendor["sorted"] = []
+        for index in range(9):
+            sku = str(200 + index)
+            stock = {"stockCode": 1 if index < 2 else 0,
+                     "stock": {"stockStateId": 34 if index < 2 else 33}}
+            raw = {"Id": sku, **stock}
+            item_type = 4 if index == 0 else 1
+            if item_type == 4:
+                raw = {"Id": "FAKE_INTERNAL", "vskuId": sku, "vskuSelf": stock,
+                       "items": [{"item": {"Id": "900", "Name": "Example component", "Num": 1,
+                                           "stockCode": 0, "stock": {"stockStateId": 33}}}]}
+            raw_vendor["sorted"].append({"itemType": item_type, "item": raw})
+            vendor["items"].append({"skuId": sku, "name": f"Example main {index}",
+                                    "num": 1, "priceShow": "10.00", "itemType": item_type})
+        data["resultData"]["cartInfo"]["cartShowNum"] = 9
+        result = normalize_cart(data, 50)
+        self.assertEqual(result["count"], 9)
+        self.assertEqual(result["main_quantity"], 9)
+        self.assertEqual(result["availability_counts"], {
+            "in_stock": 7, "out_of_stock": 2, "unavailable": 0, "unknown": 0})
+        self.assertEqual(result["items"][0]["availability"], "out_of_stock")
+        self.assertEqual(result["component_count"], 1)
+        self.assertFalse(result["partial"])
+        self.assertIsNone(result["coverage"]["account_cart_complete"])
+        limited = normalize_cart(data, 1)
+        self.assertEqual(limited["availability_counts"]["out_of_stock"], 1)
+        self.assertTrue(limited["partial"])
+
+    def test_stock_unknown_conflicting_and_delisted_states_are_distinct(self):
+        for signals, expected in (
+            ({}, "unknown"),
+            ({"stockCode": 0}, "unknown"),
+            ({"stockCode": 1, "stock": {"stockStateId": 33}}, "unknown"),
+            ({"stockCode": True, "stock": {"stockStateId": 34}}, "unknown"),
+            ({"stockCode": "1", "stock": {"stockStateId": 34}}, "unknown"),
+            ({"stockCode": 1, "stock": {"stockStateId": 34}}, "out_of_stock"),
+            ({"stockCode": 0, "stock": {"stockStateId": 33}, "unusableType": 1}, "unavailable"),
+        ):
+            with self.subTest(signals=signals):
+                data = fixture()
+                data["resultData"]["cartInfo"]["vendors"][0]["sorted"][0]["item"].update(signals)
+                self.assertEqual(normalize_cart(data, 50)["items"][0]["availability"], expected)
+        data = fixture()
+        data["resultData"]["cartInfo"]["cartShowNum"] = "FAKE_PRIVATE"
+        data["businessData"]["page"]["totalPageNum"] = "FAKE_PRIVATE"
+        result = normalize_cart(data, 50)
+        self.assertIsNone(result["coverage"]["reported_main_count"])
+        self.assertIsNone(result["coverage"]["reported_page_count"])
         self.assertNotIn("FAKE_", json.dumps(result))
 
     def test_missing_or_conditional_prices_stay_unknown(self):
