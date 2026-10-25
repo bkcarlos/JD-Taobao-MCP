@@ -116,8 +116,20 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         self.browser.checkpoint_login.side_effect=None;self.browser.checkpoint_login.return_value=True
         self.assertEqual((await self.client.get('/login/status')).json()['status'],'saved')
         self.assertEqual((await self.client.get('/login/qr')).status_code,409)
-        self.assertEqual((await self.client.post('/login/close',json={},headers=self.headers)).status_code,200)
+        closed=await self.client.post('/login/close',json={},headers=self.headers)
+        self.assertEqual(closed.status_code,200)
+        self.assertTrue(closed.json()['login_saved'])
         self.assertEqual((await self.client.get('/login/status')).status_code,401)
+
+    async def test_close_without_credentials_never_claims_login_was_saved(self):
+        for start in (False, True):
+            await self.authorize()
+            if start:
+                await self.client.post('/login/start',json={},headers=self.headers)
+            closed=await self.client.post('/login/close',json={},headers=self.headers)
+            self.assertEqual(closed.status_code,200)
+            self.assertFalse(closed.json()['login_saved'])
+            self.assertIsNone(self.portal.session)
 
     async def test_invalid_public_url_is_rejected(self):
         for url in ('http://public.example/login','https://user:pass@example.test/login',

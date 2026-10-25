@@ -173,14 +173,15 @@ class LoginPortal:
         async with self.lock:
             if not self.authorized(request):
                 return Response(status_code=401)
+            saved = bool(self.session and self.session.phase == "saved")
             if self.session and self.session.phase == "waiting":
                 try:
-                    await self.browser.checkpoint_login()
+                    saved = await self.browser.checkpoint_login()
                 except (OSError, SafetyError, PlaywrightError):
                     return JSONResponse({"error": "登录状态未保存，请重试关闭。"}, status_code=503)
             self.browser.login_until = 0.0
             self.session = None
-            response = JSONResponse({"ok": True})
+            response = JSONResponse({"ok": True, "login_saved": saved})
             response.delete_cookie("shopping_login", path="/login", secure=self.secure, httponly=True, samesite="strict")
             return response
 
@@ -203,11 +204,12 @@ _HTML = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta n
 const status=document.querySelector('#status'),qr=document.querySelector('#qr'),start=document.querySelector('#start'),close=document.querySelector('#close');
 let stopped=false,objectUrl=null,timer=null,misses=0;
 const ticket=location.hash.slice(1);history.replaceState(null,'','/login');
+window.addEventListener('hashchange',()=>{if(location.hash)location.reload();});
 async function api(path,body){const r=await fetch('/login/'+path,{method:body?'POST':'GET',credentials:'same-origin',cache:'no-store',headers:body?{'Content-Type':'application/json','X-Login-Action':'1'}:{},body:body?JSON.stringify(body):undefined});const data=await r.json();if(!r.ok)throw Error(data.error||'登录页已过期，请重新生成链接。');return data;}
 function hide(){qr.hidden=true;if(objectUrl){URL.revokeObjectURL(objectUrl);objectUrl=null;}}
 function fail(e){status.textContent=e.message;stopped=true;clearTimeout(timer);hide();}
 async function poll(){if(stopped)return;try{const s=await api('status');if(s.status==='saved'){status.textContent='登录状态已保存，可以回到 Rakazo 查询商品。有效性以实际查询为准。';hide();start.disabled=true;stopped=true;return;}if(s.status==='waiting'){const r=await fetch('/login/qr',{credentials:'same-origin',cache:'no-store'});if(r.ok){const next=URL.createObjectURL(await r.blob());if(objectUrl)URL.revokeObjectURL(objectUrl);objectUrl=next;qr.src=next;qr.hidden=false;misses=0;status.textContent='用京东 App 扫码，并在手机上确认。';}else{hide();if(++misses>3)status.textContent='二维码尚未就绪、已过期或需人工验证。可尝试刷新二维码。';}}timer=setTimeout(poll,3000);}catch(e){fail(e);}}
 start.onclick=async()=>{start.disabled=true;clearTimeout(timer);stopped=true;hide();status.textContent='正在加载京东二维码…';try{const r=await api('start',{});if(r.status==='saved'){status.textContent='登录状态已保存。';return;}stopped=false;start.textContent='刷新二维码';await poll();}catch(e){fail(e);}finally{if(!stopped)start.disabled=false;else if(!status.textContent.includes('已保存'))start.disabled=false;}};
-close.onclick=async()=>{try{await api('close',{});stopped=true;clearTimeout(timer);hide();start.disabled=true;close.disabled=true;status.textContent='入口已关闭，已保存的登录状态仍保留。';}catch(e){fail(e);}};
+close.onclick=async()=>{try{const result=await api('close',{});stopped=true;clearTimeout(timer);hide();start.disabled=true;close.disabled=true;status.textContent=result.login_saved?'入口已关闭，登录状态已保存。':'入口已关闭，本次未确认登录成功。请重新生成链接并完成扫码。';}catch(e){fail(e);}};
 (async()=>{try{if(ticket)await api('session',{ticket});const s=await api('status');close.disabled=false;if(s.status==='saved'){status.textContent='登录状态已保存，可以回到 Rakazo。';return;}start.disabled=false;status.textContent='二维码仅供你本人扫码。入口 10 分钟内有效。';if(s.status==='waiting'){start.textContent='刷新二维码';poll();}}catch(e){fail(e);}})();
 </script></body></html>'''

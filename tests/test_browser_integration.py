@@ -82,8 +82,11 @@ class BrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await self.page.get_by_text("登录状态已保存，可以回到 Rakazo 查询商品。有效性以实际查询为准。",exact=True).wait_for(timeout=10000)
             self.assertTrue(await self.page.locator("#qr").is_hidden())
             await self.page.get_by_role("button",name="关闭入口",exact=True).click()
-            await self.page.get_by_text("入口已关闭，已保存的登录状态仍保留。",exact=True).wait_for()
+            await self.page.get_by_text("入口已关闭，登录状态已保存。",exact=True).wait_for()
             self.assertIsNone(portal.session)
+            await self.page.goto(portal.issue()["login_url"])
+            await self.page.get_by_role("button",name="关闭入口",exact=True).click()
+            await self.page.get_by_text("入口已关闭，本次未确认登录成功。请重新生成链接并完成扫码。",exact=True).wait_for()
         finally:
             server.should_exit=True
             await asyncio.wait_for(task,5)
