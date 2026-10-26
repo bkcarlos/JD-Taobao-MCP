@@ -1,10 +1,10 @@
 # Security boundaries
 
-This is a local, single-user product and JD cart reader. Complete login and verification directly in the visible browser. Never give account passwords, SMS codes, payment credentials or identity documents to an MCP client.
+This is a local, single-user product, JD cart and order-history reader. Complete login and verification directly in the visible browser. Never give account passwords, SMS codes, payment credentials or identity documents to an MCP client.
 
 ## Data exposed to MCP
 
-- Only explicitly allowed public product, search and home pages can be inspected. The fixed official login URLs can be opened with `open_login`; generic `open_url` accepts public pages only. Login pages can be used manually, but their contents cannot be exported. Account, order, address and payment routes are not readable.
+- Only explicitly allowed public product, search and home pages can be inspected by generic tools. The fixed official login URLs can be opened with `open_login`; generic `open_url` accepts public pages only. Login pages can be used manually, but their contents cannot be exported. Generic tools reject account, order, address and payment routes.
 - Link enumeration exports only references and allowed URLs, not input values, labels, anchor text or page text. Product extractors return selected fields, not raw page bodies or raw JSON-LD. Whole-page parameter and review fallbacks are removed.
 - Cookie presence is checked locally as a login hint. Neither cookie names nor values are returned.
 - Input, form submission, screenshot and history tools are removed. Link navigation does not invoke page click handlers. Setting the old `ALLOW_STATE_CHANGING_ACTIONS=true` fails at startup.
@@ -36,6 +36,35 @@ MCP client/model; they are not public product results. The server does not persi
 but clients may store tool results in their chat history. All clients holding the MCP
 token can access this single user's cart; keep the token private. No real cart fixtures
 belong in the repository. Missing prices remain unknown, and partial results are labeled.
+
+### Private JD order history
+
+`get_orders` is another authenticated account-data capability. It uses an ephemeral
+context, copies only cookies applicable to the fixed JD order and session-sync hosts,
+and reads the most recent three months, up to five pages and 100 orders. The initial
+order document may redirect between `order.jd.com/center/list.action`,
+`order.jd.hk/center/list.action`, `passport.jd.com/new/login.aspx` and
+`sso.jd.hk/sso/sync/redirect`. Each GET redirect is inspected, capped at eight hops,
+and its return URL must target a fixed order document. Credentials are never entered;
+login or verification that cannot be completed by the existing session fails closed.
+Synchronization URLs and newly issued cookies stay in the temporary context.
+
+Rendering permits only the fixed paginated order documents, static assets from
+`360buyimg.com`, the observed `gias.jd.com/js/pc-tk.js` script, and the POST query
+`pcorder_center_list` at `/api` on `api.m.jd.com` or `color.jd.hk`. Query bodies must
+specify the recent-three-months period, all statuses and a bounded page number.
+Other APIs, redirects, iframe documents, WebSockets and downloads are blocked.
+No cancellations, deletions, payments, invoice requests, receipt confirmations or
+other order mutations are enabled.
+
+Only merchandise, quantities, gift markers, order time, status and the displayed
+amount and label are returned. Order IDs are used only for in-memory deduplication;
+recipients, addresses, phone numbers, invoice data, payment accounts and raw responses
+are discarded. Unknown amounts remain unknown and are never substituted with another
+payment field. Canceled orders, unpaid orders and gift suborders remain distinguishable
+by their provider metadata. Failed pages, changing totals, duplicates and result limits
+produce partial results. These private results share the cart capability's single-user
+token and client-history limitations; never commit real order fixtures.
 
 ## Network controls and limitations
 

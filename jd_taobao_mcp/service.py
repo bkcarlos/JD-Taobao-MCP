@@ -26,6 +26,14 @@ class ShoppingBrowserService:
             raise ValueError("max_items 必须是 1 到 100 的整数。")
         return await self.jd_browser.get_cart(max_items)
 
+    async def get_orders(self, platform: str = "jd", max_orders: int = 50) -> dict[str, Any]:
+        """Return recent JD order metadata, with strict platform and result limits."""
+        if platform != "jd":
+            raise ValueError("订单读取目前仅支持京东（jd）。")
+        if type(max_orders) is not int or not 1 <= max_orders <= 100:
+            raise ValueError("max_orders 必须是 1 到 100 的整数。")
+        return await self.jd_browser.get_orders(max_orders)
+
     async def search_products(
         self,
         platform: str,

