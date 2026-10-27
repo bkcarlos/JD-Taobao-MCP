@@ -1,6 +1,6 @@
 # Security boundaries
 
-This is a local, single-user product, JD cart and order-history reader. Complete login and verification directly in the visible browser. Never give account passwords, SMS codes, payment credentials or identity documents to an MCP client.
+This is a local, single-user product, JD cart, order-history and followed-product reader. Complete login and verification directly in the visible browser. Never give account passwords, SMS codes, payment credentials or identity documents to an MCP client.
 
 ## Data exposed to MCP
 
@@ -65,6 +65,25 @@ payment field. Canceled orders, unpaid orders and gift suborders remain distingu
 by their provider metadata. Failed pages, changing totals, duplicates and result limits
 produce partial results. These private results share the cart capability's single-user
 token and client-history limitations; never commit real order fixtures.
+
+### Private JD followed products
+
+`get_followed_products` reads the official desktop cart's unfiltered "刚收藏" list.
+It copies cookies applicable to the cart and API hosts into an ephemeral context,
+loads the fixed cart document and reuses JD's own signing SDK. The only API allowed
+is the GET `pc_follow_product_new` query on `https://api.m.jd.com/api`, with fixed
+source, page size 20 and page numbers 1–6. At most five data pages and one empty-page
+probe are fetched; at most 100 products are returned. Filters, duplicate parameters,
+mutating APIs, redirects, iframe documents, WebSockets, service workers and downloads
+are blocked. No follow/unfollow, cart changes or coupon collection is performed.
+
+Only product names, canonical product links, displayed prices and their labels are
+returned. Signing values, cookies and raw responses remain internal. Missing prices
+remain unknown. Duplicate or malformed entries, failed pages and limits produce partial
+results; only an empty response page confirms the end of this desktop list. It does
+not establish completeness across the mobile app or include followed stores. Results
+share the other private capabilities' token and client-history limitations. All tests
+use synthetic products and account sentinels; never commit real followed lists.
 
 ## Network controls and limitations
 

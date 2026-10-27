@@ -16,6 +16,7 @@ from playwright.async_api import (
 from .config import Settings
 from .cart import cart_failure, read_jd_cart
 from .orders import orders_failure, read_jd_orders
+from .followed import followed_failure, read_jd_followed
 from .login_state import load_cookies, save_cookies, likely_logged_in, save_navigation_diagnostic
 from .safety import (
     SafetyError, display_url, ensure_allowed_url, ensure_readable_url,
@@ -288,6 +289,16 @@ class BrowserController:
                 return orders_failure("login_required")
             return await read_jd_orders(self._context, max_orders, self.settings.navigation_timeout_ms)
 
+    async def get_followed_products(self, max_items: int) -> dict[str, Any]:
+        """Reuse the current login for an isolated, read-only followed-product query."""
+        async with self._lock:
+            self.ensure_not_logging_in()
+            await self._active_page_unlocked()
+            assert self._context is not None
+            if not likely_logged_in(await self._context.cookies(), "jd"):
+                return followed_failure("login_required")
+            return await read_jd_followed(self._context, max_items, self.settings.navigation_timeout_ms)
+
     async def start_qr_login(self, deadline: float) -> None:
         """Open only the official JD login page for a short-lived human session."""
         async with self._lock:
@@ -456,7 +467,8 @@ class BrowserController:
                 return False
             if self._human_pointer_id is not None:
                 return False
-            if self._page is not None and (is_jd_login_callback(self._page.url)
+            if self._page is not None and (urlparse(self._page.url).hostname == "passport.jd.com"
+                                           or is_jd_login_callback(self._page.url)
                                            or is_jd_verification_page(self._page.url)):
                 # Cookie presence must not interrupt an unfinished handoff or
                 # close the human's challenge before JD finishes processing it.

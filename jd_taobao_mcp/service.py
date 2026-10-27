@@ -34,6 +34,14 @@ class ShoppingBrowserService:
             raise ValueError("max_orders 必须是 1 到 100 的整数。")
         return await self.jd_browser.get_orders(max_orders)
 
+    async def get_followed_products(self, platform: str = "jd", max_items: int = 50) -> dict[str, Any]:
+        """Validate the platform and bound the private followed-product result."""
+        if platform != "jd":
+            raise ValueError("关注商品读取目前仅支持京东（jd）。")
+        if type(max_items) is not int or not 1 <= max_items <= 100:
+            raise ValueError("max_items 必须是 1 到 100 的整数。")
+        return await self.jd_browser.get_followed_products(max_items)
+
     async def search_products(
         self,
         platform: str,
