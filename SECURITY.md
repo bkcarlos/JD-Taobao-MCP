@@ -68,22 +68,21 @@ token and client-history limitations; never commit real order fixtures.
 
 ### Private JD followed products
 
-`get_followed_products` reads the official desktop cart's unfiltered "刚收藏" list.
-It copies cookies applicable to the cart and API hosts into an ephemeral context,
-loads the fixed cart document and reuses JD's own signing SDK. The only API allowed
-is the GET `pc_follow_product_new` query on `https://api.m.jd.com/api`, with fixed
-source, page size 20 and page numbers 1–6. At most five data pages and one empty-page
-probe are fetched; at most 100 products are returned. Filters, duplicate parameters,
-mutating APIs, redirects, iframe documents, WebSockets, service workers and downloads
-are blocked. No follow/unfollow, cart changes or coupon collection is performed.
+`get_followed_products` reads server-rendered documents at the fixed official
+`https://t.jd.com/home/follow?index=N` URL, with a bounded page index from 1 to 10.
+Only cookies applicable to that host are copied into an ephemeral context. Site
+JavaScript is disabled; all browser subrequests and WebSockets are blocked. Documents
+are fetched separately with automatic redirects disabled. No API calls, action links,
+follow/unfollow operations, cart changes or coupon collection are performed.
 
-Only product names, canonical product links, displayed prices and their labels are
-returned. Signing values, cookies and raw responses remain internal. Missing prices
-remain unknown. Duplicate or malformed entries, failed pages and limits produce partial
-results; only an empty response page confirms the end of this desktop list. It does
-not establish completeness across the mobile app or include followed stores. Results
-share the other private capabilities' token and client-history limitations. All tests
-use synthetic products and account sentinels; never commit real followed lists.
+The fixed DOM projection returns product names, canonical product links, visible prices
+and pager metadata. Historical `price` attributes and undisplayed estimates are never
+substituted for missing current prices. Each page must report the expected page index
+and size; duplicates, changed totals, missing rows, failed pages and the 100-item limit
+produce partial results. A complete desktop list does not establish completeness across
+the mobile app or include followed stores. Raw documents and account data are discarded;
+results share the other private capabilities' token and client-history limitations.
+All tests use synthetic products and account sentinels; never commit real followed lists.
 
 ## Network controls and limitations
 

